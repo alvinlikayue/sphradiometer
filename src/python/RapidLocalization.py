@@ -521,13 +521,17 @@ class rapidskyloc_io(object):
 		# step;  (v) exponentiate to obtain the not-yet-normalized
 		# probability mass for each pixel;  (vi) apply a final
 		# normalization to make the sum of the probabilities 1.
-		_, _, prob_p = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series_p))
-		prob_p = np.exp(prob_p - prob_p.max())
-		prob_p /= sum(prob_p)
-		_, _, prob_n = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series_n))
-		prob_n = np.exp(prob_n - prob_n.max())
-		prob_n /= sum(prob_n)
-		self.prob = (prob_p + prob_n) / 2.0
+		_, _, log_prob_p = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series_p))
+		_, _, log_prob_n = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series_n))
+
+		# The detected-CBC posterior marginalizes over beta = +/-1 by
+		# summing the two branch likelihoods, then normalizing the final
+		# map.  Normalizing the two branches independently before summing
+		# erases their relative evidence and can over-weight an antipodal
+		# branch.
+		log_prob_max = max(log_prob_p.max(), log_prob_n.max())
+		self.prob = 0.5 * np.exp(log_prob_p - log_prob_max) + 0.5 * np.exp(log_prob_n - log_prob_max)
+		self.prob /= sum(self.prob)
 
 	def to_xml(self, name):
 		"""
