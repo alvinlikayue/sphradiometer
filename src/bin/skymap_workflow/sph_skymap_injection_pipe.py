@@ -234,7 +234,7 @@ def build_auto_manifest(cp, dag_dir):
 	manifest_cp.set("manifest", "order", cp.get("manifest", "order", fallback="asc"))
 	manifest_cp.set("manifest", "limit", cp.get("manifest", "limit", fallback=""))
 	manifest_cp.set("manifest", "allow_missing_bank_rows", "false")
-	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where", "instruments", "exclude_time_windows", "exclude_injection_associations"):
+	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where", "instruments", "exclude_time_windows", "exclude_injection_associations", "zero_lag_only"):
 		if cp.has_option("manifest", key):
 			manifest_cp.set("manifest", key, cp.get("manifest", key))
 	for key, fallback in (("gps_pad", "70"), ("snr_pad", "1"), ("pre_trigger", "0.12"), ("row_counts", "1")):
