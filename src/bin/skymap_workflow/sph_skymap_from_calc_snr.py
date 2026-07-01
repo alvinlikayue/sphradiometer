@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Create one skymap from gstlal_inspiral_calc_snr XML dumps."""
+
+import argparse
+import glob
+import os
+import re
+import subprocess
+
+import lal
+import ligolw
+import ligolw.utils
+import numpy as np
+from ligo.skymap import io as skymap_io
+from sphradiometer.RapidLocalization import RapidLocalization, RapidLocalization_, rapidskyloc_io
+from sphradiometer import healpix as sph_healpix
+from sphradiometer import sphradiometer as sph
+
+from sph_skymap_common import load_relative_psd_weights
+
+
+def filename_gps_start(path):
+	match = re.search(r"-(\d+)-\d+\.xml(?:\.gz)?$", os.path.basename(path))
+	if not match:
+		raise ValueError(f"could not parse GPS start time from SNR filename: {path}")
+	return float(match.group(1))
+
+
+def read_calc_snr(calc_snr_dir, bank_number, row_number):
+	files = {
+		os.path.basename(path).split("-")[0]: path
+		for path in glob.glob(os.path.join(calc_snr_dir, "*SNR*.xml.gz"))
+	}
+	if not files:
+		raise FileNotFoundError(f"no *SNR*.xml.gz files found in {calc_snr_dir}")
+
+	full = {}
+	aut = {}
+	for ifo, path in sorted(files.items()):
+		doc = ligolw.utils.load_filename(path)
+		arrays = {array.Name: array.array for array in doc.getElementsByTagName(ligolw.Array.tagName)}
+		snr_name = f"{ifo}_{bank_number}_{row_number}"
+		if snr_name not in arrays:
+			raise KeyError(f"{snr_name} not found in {path}")
+		snr_arr = arrays[snr_name]
+		times = np.asarray(snr_arr[0], dtype=float)
+		if times.size and np.nanmax(np.abs(times)) < 1e6:
+			times = times + filename_gps_start(path)
+		ac_arr = arrays["autocorrelation_bank"]
+		full[ifo] = (times, np.asarray(snr_arr[1] + 1j * snr_arr[2], dtype=np.complex128))
+		vector = lal.CreateCOMPLEX16Vector(len(ac_arr))
+		vector.data = np.asarray(ac_arr, dtype=np.complex128)
+		aut[ifo] = vector
+		doc.unlink()
+	return full, aut
+
+
+def build_common_window(full, aut, center_time, pre_trigger, start_idx_override=None):
+	dt = float(full[sorted(full)[0]][0][1] - full[sorted(full)[0]][0][0])
+	input_len = len(next(iter(aut.values())).data)
+	ref_ifo = sorted(full)[0]
+	t0 = float(full[ref_ifo][0][0])
+	if start_idx_override is None:
+		start_idx = int(round((center_time - pre_trigger - t0) / dt))
+	else:
+		start_idx = start_idx_override
+	if start_idx < 0 or start_idx + input_len > len(full[ref_ifo][1]):
+		raise ValueError(
+			f"common window [{start_idx}, {start_idx + input_len}) outside SNR array length {len(full[ref_ifo][1])}"
+		)
+
+	snr = {}
+	for ifo, (times, z) in full.items():
+		data = np.asarray(z[start_idx:start_idx + input_len], dtype=np.complex128)
+		series = lal.CreateCOMPLEX16TimeSeries(
+			ifo,
+			lal.LIGOTimeGPS(float(times[start_idx])),
+			0.0,
+			dt,
+			lal.DimensionlessUnit,
+			input_len,
+		)
+		series.data.data = data
+		snr[ifo] = series
+		peak_i = int(np.argmax(np.abs(data)))
+		print(ifo, "peak_abs", float(abs(data[peak_i])), "peak_time", float(times[start_idx]) + peak_i * dt)
+	return snr, dt
+
+
+def coeff_series_to_prob(series):
+	_, _, log_prob = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series.get()))
+	prob = np.exp(log_prob - log_prob.max())
+	prob /= np.sum(prob)
+	return prob
+
+
+def write_prob_fits(prob, path):
+	os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+	skymap_io.write_sky_map(path, prob)
+	print("wrote", path, "npix", len(prob), "sum", float(np.sum(prob)))
+
+
+def write_skymap_png(fits_path, png_path, ra_deg=None, dec_deg=None, contour=None):
+	cmd = [
+		"ligo-skymap-plot",
+		fits_path,
+		"-o",
+		png_path,
+		"--annotate",
+		"--contour",
+		] + [str(value) for value in (contour or ["50", "90"])]
+	if ra_deg is not None and dec_deg is not None:
+		cmd += ["--radec", str(ra_deg), str(dec_deg)]
+	subprocess.check_call(cmd)
+	print("wrote", png_path)
+
+
+def main():
+	parser = argparse.ArgumentParser()
+	parser.add_argument("--calc-snr-dir", required=True)
+	parser.add_argument("--output-fits", required=True)
+	parser.add_argument("--output-fits-p")
+	parser.add_argument("--output-fits-n")
+	parser.add_argument("--output-coeff-p")
+	parser.add_argument("--output-coeff-n")
+	parser.add_argument("--output-png")
+	parser.add_argument("--output-png-p")
+	parser.add_argument("--output-png-n")
+	parser.add_argument("--precalc-dir")
+	parser.add_argument("--psd-xml")
+	parser.add_argument("--mode", choices=("flat", "asd", "psd"), default="asd")
+	parser.add_argument("--bank-number", required=True)
+	parser.add_argument("--row-number", required=True)
+	parser.add_argument("--coinc-event-id", type=int)
+	parser.add_argument("--center-time", type=float, required=True)
+	parser.add_argument("--pre-trigger", type=float, default=0.12)
+	parser.add_argument("--start-idx", type=int)
+	parser.add_argument("--precalc-len", type=int, default=438)
+	parser.add_argument("--sample-rate", type=float, default=2048.0)
+	parser.add_argument("--effective-sample-rate", type=int, default=512)
+	parser.add_argument("--ra-deg", type=float)
+	parser.add_argument("--dec-deg", type=float)
+	parser.add_argument("--contour", nargs="+", default=["50", "90"])
+	args = parser.parse_args()
+
+	full, aut = read_calc_snr(args.calc_snr_dir, args.bank_number, args.row_number)
+	snr, dt = build_common_window(full, aut, args.center_time, args.pre_trigger, args.start_idx)
+	instruments = sorted(snr)
+
+	if args.precalc_dir:
+		loc = RapidLocalization.read(args.precalc_dir)
+	else:
+		if not args.psd_xml:
+			raise ValueError("--psd-xml is required when --precalc-dir is not provided")
+		psds = load_relative_psd_weights(args.psd_xml, instruments, args.precalc_len, args.sample_rate, args.mode)
+		loc = RapidLocalization_(psds, args.precalc_len, dt, effective_sample_rate=args.effective_sample_rate)
+
+	skyp, skyn = loc.sphcoeff(snr, aut)
+	sky = rapidskyloc_io(skyp, skyn, coinc_event_id=args.coinc_event_id)
+
+	os.makedirs(os.path.dirname(os.path.abspath(args.output_fits)), exist_ok=True)
+	if args.output_coeff_p:
+		os.makedirs(os.path.dirname(os.path.abspath(args.output_coeff_p)), exist_ok=True)
+		if sph.sh_series_write_healpix_alm(skyp.get(), args.output_coeff_p):
+			raise RuntimeError(f"failed to write {args.output_coeff_p}")
+		print("wrote", args.output_coeff_p)
+	if args.output_coeff_n:
+		os.makedirs(os.path.dirname(os.path.abspath(args.output_coeff_n)), exist_ok=True)
+		if sph.sh_series_write_healpix_alm(skyn.get(), args.output_coeff_n):
+			raise RuntimeError(f"failed to write {args.output_coeff_n}")
+		print("wrote", args.output_coeff_n)
+	with open(args.output_fits, "wb") as f:
+		f.write(sky.to_fits_buffer(fmt="bayestar"))
+	print("wrote", args.output_fits, "npix", len(sky.prob), "sum", float(np.sum(sky.prob)))
+
+	if args.output_fits_p or args.output_png_p:
+		output_fits_p = args.output_fits_p or os.path.splitext(args.output_png_p)[0] + ".fits"
+		write_prob_fits(coeff_series_to_prob(skyp), output_fits_p)
+		if args.output_png_p:
+			write_skymap_png(output_fits_p, args.output_png_p, args.ra_deg, args.dec_deg, args.contour)
+	if args.output_fits_n or args.output_png_n:
+		output_fits_n = args.output_fits_n or os.path.splitext(args.output_png_n)[0] + ".fits"
+		write_prob_fits(coeff_series_to_prob(skyn), output_fits_n)
+		if args.output_png_n:
+			write_skymap_png(output_fits_n, args.output_png_n, args.ra_deg, args.dec_deg, args.contour)
+
+	if args.output_png:
+		write_skymap_png(args.output_fits, args.output_png, args.ra_deg, args.dec_deg, args.contour)
+
+
+if __name__ == "__main__":
+	main()

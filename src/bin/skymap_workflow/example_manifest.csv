@@ -1,0 +1,2 @@
+simulation_id,coinc_event_id,center_time,gps_start_time,gps_end_time,snr_start,snr_end,bank_number,row_number,row_counts,ht_gate_threshold,ra_deg,dec_deg,pre_trigger
+12146,612,1243550166.797148883,1243550100,1243550240,1243550166,1243550168,2,174,1,87.96744807692308,316.0592474856384,8.907945582321858,0.12

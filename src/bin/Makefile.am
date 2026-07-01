@@ -4,6 +4,21 @@ bin_PROGRAMS = \
 	inspiral_sky_map \
 	sphradiometer_demo
 
+dist_bin_SCRIPTS = \
+	skymap_workflow/sph_skymap_common.py \
+	skymap_workflow/sph_skymap_from_calc_snr.py \
+	skymap_workflow/sph_skymap_injection_pipe.py \
+	skymap_workflow/sph_skymap_precompute.py \
+	skymap_workflow/sph_skymap_precompute_pipe.py \
+	skymap_workflow/sph_spherical_harmonic_coeff_summary.py
+
+skymap_workflowdocdir = $(pkgdatadir)/skymap_workflow
+dist_skymap_workflowdoc_DATA = \
+	skymap_workflow/README.md \
+	skymap_workflow/example_injections.ini \
+	skymap_workflow/example_manifest.csv \
+	skymap_workflow/example_precompute.ini
+
 noinst_PROGRAMS = \
 	fastX
 
