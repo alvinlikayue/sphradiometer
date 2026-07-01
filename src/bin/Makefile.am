@@ -17,6 +17,7 @@ dist_skymap_workflowdoc_DATA = \
 	skymap_workflow/README.md \
 	skymap_workflow/example_injections.ini \
 	skymap_workflow/example_manifest.csv \
+	skymap_workflow/example_noise_candidates.ini \
 	skymap_workflow/example_precompute.ini
 
 noinst_PROGRAMS = \

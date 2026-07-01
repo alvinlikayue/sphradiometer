@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate a DAG that turns an injection/template manifest into skymaps."""
+"""Generate a DAG that turns a GstLAL candidate manifest into skymaps."""
 
 import argparse
 import configparser
@@ -26,7 +26,7 @@ try:
 except ImportError:
 	diagnostics = None
 
-if diagnostics is None or not hasattr(diagnostics, "svd_bank_strings_from_cache"):
+if diagnostics is None or any(not hasattr(diagnostics, name) for name in ("svd_bank_strings_from_cache", "query_noise_candidates_from_sqlite", "make_noise_candidate_manifest_rows")):
 	source_diagnostics = "/src/gstlal/gstlal-ugly/python/diagnostics.py"
 	if os.path.exists(source_diagnostics):
 		spec = importlib.util.spec_from_file_location("gstlal_ugly_diagnostics", source_diagnostics)
@@ -186,17 +186,44 @@ def choose_reference_psd(psds, center_time):
 	return min(psds, key=lambda item: abs((item[0] + item[1]) / 2.0 - center_time))[2]
 
 
+def gstlal_database_mode(cp):
+	mode = cp.get("gstlal", "database_type", fallback="").strip().lower()
+	if not mode:
+		if cp.has_option("gstlal", "noise_database") or cp.has_option("gstlal", "candidate_database"):
+			mode = "noise"
+		else:
+			mode = "injection"
+	if mode in ("background", "zerolag", "candidate", "candidates"):
+		mode = "noise"
+	if mode not in ("injection", "noise"):
+		raise ValueError("[gstlal] database_type must be 'injection' or 'noise'")
+	return mode
+
+
+def gstlal_database_path(cp, mode):
+	if mode == "noise":
+		for option in ("noise_database", "candidate_database", "database", "injection_database"):
+			if cp.has_option("gstlal", option):
+				return abs_if_set(cp.get("gstlal", option))
+	else:
+		for option in ("injection_database", "database"):
+			if cp.has_option("gstlal", option):
+				return abs_if_set(cp.get("gstlal", option))
+	raise ValueError(f"[gstlal] is missing a SQLite database option for {mode} mode")
+
+
 def build_auto_manifest(cp, dag_dir):
 	if diagnostics is None:
 		raise ImportError("gstlal.diagnostics is required for [gstlal] auto-discovery mode")
 
 	run_dir = abs_if_set(cp.get("gstlal", "run_dir"))
-	database = abs_if_set(cp.get("gstlal", "injection_database"))
+	mode = gstlal_database_mode(cp)
+	database = gstlal_database_path(cp, mode)
 	output_root = os.path.join(dag_dir, "outputs")
 	os.makedirs(output_root, exist_ok=True)
-	log(f"auto mode enabled")
+	log(f"auto mode enabled ({mode})")
 	log(f"gstlal run_dir = {run_dir}")
-	log(f"injection database = {database}")
+	log(f"{mode} database = {database}")
 	log(f"workflow output root = {output_root}")
 
 	manifest_cp = configparser.ConfigParser()
@@ -207,88 +234,103 @@ def build_auto_manifest(cp, dag_dir):
 	manifest_cp.set("manifest", "order", cp.get("manifest", "order", fallback="asc"))
 	manifest_cp.set("manifest", "limit", cp.get("manifest", "limit", fallback=""))
 	manifest_cp.set("manifest", "allow_missing_bank_rows", "false")
-	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where"):
+	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where", "instruments", "exclude_time_windows", "exclude_injection_associations"):
 		if cp.has_option("manifest", key):
 			manifest_cp.set("manifest", key, cp.get("manifest", key))
 	for key, fallback in (("gps_pad", "70"), ("snr_pad", "1"), ("pre_trigger", "0.12"), ("row_counts", "1")):
 		manifest_cp.set("manifest", key, cp.get("manifest", key, fallback=fallback))
 	if cp.has_section("calc_snr"):
 		manifest_cp.set("manifest", "ht_gate_threshold", cp.get("calc_snr", "ht_gate_threshold", fallback=""))
-	manifest_cp.set("manifest", "injection_xml", discover_first_existing(run_dir, ["bbh_injections.xml", "injections.xml"]))
 	segments_xml = discover_first_existing(run_dir, ["segments.xml.gz", "segments.xml"])
 	channel_string = discover_channels(run_dir)
 	channel_map = parse_channel_map(channel_string)
+	manifest_cp.set("manifest", "run_dir", run_dir)
+	manifest_cp.set("manifest", "channel_name", channel_string)
 
-	log(
-		"querying injection SQLite "
-		f"(association={manifest_cp.get('manifest', 'association')}, "
-		f"order_by={manifest_cp.get('manifest', 'order_by')}, "
-		f"order={manifest_cp.get('manifest', 'order')}, "
-		f"limit={manifest_cp.get('manifest', 'limit') or 'none'})"
-	)
-	rows = diagnostics.query_recovered_injections_from_sqlite(manifest_cp)
-	log(f"selected {len(rows)} recovered injection rows from SQLite")
-	log("loading detector data segments")
-	segments_by_ifo = load_segments_by_ifo(segments_xml)
-	row_combo_by_time = {}
-	gps_pad = float(manifest_cp.get("manifest", "gps_pad"))
-	for row in rows:
-		center = float(row["center_time"])
-		ifos = ifos_covering_interval(segments_by_ifo, int(center - gps_pad), int(center + gps_pad + 0.999999))
-		if len(ifos) < int(cp.get("manifest", "min_ifo", fallback="1")):
-			continue
-		row_combo_by_time[diagnostics._format_float(row["simulation_time"])] = combo_from_ifos(ifos)
-	combo_counts = {}
-	for combo in row_combo_by_time.values():
-		combo_counts[combo] = combo_counts.get(combo, 0) + 1
-	log("selected rows by detector combo: " + ", ".join(f"{combo}={count}" for combo, count in sorted(combo_counts.items())))
-	simulation_id_by_time = {
-		diagnostics._format_float(row["simulation_time"]): str(row["simulation_id"])
-		for row in rows
-		if diagnostics._format_float(row["simulation_time"]) in row_combo_by_time
-	}
-	log("discovering injection-template-match XML files")
-	template_match_files = discover_template_match_files(run_dir)
-	log(f"found {len(template_match_files)} injection-template-match XML files")
-	log("discovering SVD bank groups")
-	svd_banks_by_combo = discover_svd_bank_strings_by_combo(run_dir)
-	log("found SVD bank group strings by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(svd_banks_by_combo.items())))
-	log("matching selected injections to SVD bank rows by geocentric time")
-	bank_map_rows = []
-	for combo in sorted(set(row_combo_by_time.values())):
-		combo_times = [time for time, row_combo in row_combo_by_time.items() if row_combo == combo]
-		if combo not in svd_banks_by_combo:
-			raise FileNotFoundError(f"no SVD bank caches found for detector combo {combo}")
-		combo_rows = diagnostics.scan_template_match_svd_bank_rows(
-			template_match_files,
-			svd_banks_by_combo[combo],
-			simulation_times=combo_times,
+	if mode == "noise":
+		log(
+			"querying non-injection SQLite "
+			f"(order_by={manifest_cp.get('manifest', 'order_by')}, "
+			f"order={manifest_cp.get('manifest', 'order')}, "
+			f"limit={manifest_cp.get('manifest', 'limit') or 'none'})"
 		)
-		for row in combo_rows:
-			row["instruments"] = combo
-			row["channel_name"] = ",".join(channels_for_combo(channel_map, combo))
-		bank_map_rows.extend(combo_rows)
-	log(f"matched {len(bank_map_rows)} injections to SVD bank rows")
-	for row in bank_map_rows:
-		row["simulation_id"] = simulation_id_by_time[row["simulation_time"]]
-	bank_map_path = os.path.join(output_root, "bank_row_map.csv")
-	diagnostics.write_bank_row_map(bank_map_rows, bank_map_path)
-	log(f"wrote bank-row map: {bank_map_path}")
-	manifest_cp.set("manifest", "bank_row_map", bank_map_path)
-	rows = [
-		row for row in rows
-		if diagnostics._format_float(row["simulation_time"]) in simulation_id_by_time
-	]
-	manifest_rows = diagnostics.make_injection_manifest_rows(manifest_cp, rows)
-	log("discovering reference PSD files")
-	psds_by_combo = discover_reference_psds_by_combo(run_dir)
-	log("found reference PSD files by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(psds_by_combo.items())))
-	log("assigning reference PSD to each manifest row")
-	for row in manifest_rows:
-		combo = row["instruments"]
-		if combo not in psds_by_combo:
-			raise FileNotFoundError(f"no reference PSD files found for detector combo {combo}")
-		row["reference_psd"] = choose_reference_psd(psds_by_combo[combo], row["center_time"])
+		rows = diagnostics.query_noise_candidates_from_sqlite(manifest_cp)
+		log(f"selected {len(rows)} noise/candidate rows from SQLite")
+		manifest_rows = diagnostics.make_noise_candidate_manifest_rows(manifest_cp, rows)
+		bank_map_path = ""
+	else:
+		manifest_cp.set("manifest", "injection_xml", discover_first_existing(run_dir, ["bbh_injections.xml", "injections.xml"]))
+
+		log(
+			"querying injection SQLite "
+			f"(association={manifest_cp.get('manifest', 'association')}, "
+			f"order_by={manifest_cp.get('manifest', 'order_by')}, "
+			f"order={manifest_cp.get('manifest', 'order')}, "
+			f"limit={manifest_cp.get('manifest', 'limit') or 'none'})"
+		)
+		rows = diagnostics.query_recovered_injections_from_sqlite(manifest_cp)
+		log(f"selected {len(rows)} recovered injection rows from SQLite")
+		log("loading detector data segments")
+		segments_by_ifo = load_segments_by_ifo(segments_xml)
+		row_combo_by_time = {}
+		gps_pad = float(manifest_cp.get("manifest", "gps_pad"))
+		for row in rows:
+			center = float(row["center_time"])
+			ifos = ifos_covering_interval(segments_by_ifo, int(center - gps_pad), int(center + gps_pad + 0.999999))
+			if len(ifos) < int(cp.get("manifest", "min_ifo", fallback="1")):
+				continue
+			row_combo_by_time[diagnostics._format_float(row["simulation_time"])] = combo_from_ifos(ifos)
+		combo_counts = {}
+		for combo in row_combo_by_time.values():
+			combo_counts[combo] = combo_counts.get(combo, 0) + 1
+		log("selected rows by detector combo: " + ", ".join(f"{combo}={count}" for combo, count in sorted(combo_counts.items())))
+		simulation_id_by_time = {
+			diagnostics._format_float(row["simulation_time"]): str(row["simulation_id"])
+			for row in rows
+			if diagnostics._format_float(row["simulation_time"]) in row_combo_by_time
+		}
+		log("discovering injection-template-match XML files")
+		template_match_files = discover_template_match_files(run_dir)
+		log(f"found {len(template_match_files)} injection-template-match XML files")
+		log("discovering SVD bank groups")
+		svd_banks_by_combo = discover_svd_bank_strings_by_combo(run_dir)
+		log("found SVD bank group strings by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(svd_banks_by_combo.items())))
+		log("matching selected injections to SVD bank rows by geocentric time")
+		bank_map_rows = []
+		for combo in sorted(set(row_combo_by_time.values())):
+			combo_times = [time for time, row_combo in row_combo_by_time.items() if row_combo == combo]
+			if combo not in svd_banks_by_combo:
+				raise FileNotFoundError(f"no SVD bank caches found for detector combo {combo}")
+			combo_rows = diagnostics.scan_template_match_svd_bank_rows(
+				template_match_files,
+				svd_banks_by_combo[combo],
+				simulation_times=combo_times,
+			)
+			for row in combo_rows:
+				row["instruments"] = combo
+				row["channel_name"] = ",".join(channels_for_combo(channel_map, combo))
+			bank_map_rows.extend(combo_rows)
+		log(f"matched {len(bank_map_rows)} injections to SVD bank rows")
+		for row in bank_map_rows:
+			row["simulation_id"] = simulation_id_by_time[row["simulation_time"]]
+		bank_map_path = os.path.join(output_root, "bank_row_map.csv")
+		diagnostics.write_bank_row_map(bank_map_rows, bank_map_path)
+		log(f"wrote bank-row map: {bank_map_path}")
+		manifest_cp.set("manifest", "bank_row_map", bank_map_path)
+		rows = [
+			row for row in rows
+			if diagnostics._format_float(row["simulation_time"]) in simulation_id_by_time
+		]
+		manifest_rows = diagnostics.make_injection_manifest_rows(manifest_cp, rows)
+		log("discovering reference PSD files")
+		psds_by_combo = discover_reference_psds_by_combo(run_dir)
+		log("found reference PSD files by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(psds_by_combo.items())))
+		log("assigning reference PSD to each manifest row")
+		for row in manifest_rows:
+			combo = row["instruments"]
+			if combo not in psds_by_combo:
+				raise FileNotFoundError(f"no reference PSD files found for detector combo {combo}")
+			row["reference_psd"] = choose_reference_psd(psds_by_combo[combo], row["center_time"])
 
 	manifest_path = os.path.join(output_root, "autogenerated_manifest.csv")
 	with open(manifest_path, "w", newline="") as f:
@@ -303,13 +345,14 @@ def build_auto_manifest(cp, dag_dir):
 		"segments_xml": segments_xml,
 		"channel_name": channel_string,
 		"reference_psd": manifest_rows[0]["reference_psd"] if manifest_rows else "",
-		"injection_xml": discover_first_existing(run_dir, ["bbh_injections.xml", "injections.xml"]),
-		"injection_time_slide_file": discover_first_existing(run_dir, ["inj_tisi.xml", "injection_timeslides.xml", "injection_time_slides.xml"]),
+		"injection_xml": discover_first_existing(run_dir, ["bbh_injections.xml", "injections.xml"]) if mode == "injection" else "",
+		"injection_time_slide_file": discover_first_existing(run_dir, ["inj_tisi.xml", "injection_timeslides.xml", "injection_time_slides.xml"]) if mode == "injection" else "",
 	}
 	print("Auto-discovered GstLAL run products:")
 	for key, value in sorted(discovered.items()):
 		print(f"  {key}: {value}")
-	print(f"  bank_row_map: {bank_map_path}")
+	if bank_map_path:
+		print(f"  bank_row_map: {bank_map_path}")
 	print(f"  manifest_rows: {len(manifest_rows)}")
 	return read_manifest(manifest_path), discovered
 
@@ -341,7 +384,7 @@ def main():
 	os.makedirs(skymap_branch_root, exist_ok=True)
 	os.makedirs(coeff_root, exist_ok=True)
 
-	if cp.has_section("gstlal") and cp.has_option("gstlal", "run_dir") and cp.has_option("gstlal", "injection_database"):
+	if cp.has_section("gstlal") and cp.has_option("gstlal", "run_dir") and any(cp.has_option("gstlal", option) for option in ("injection_database", "noise_database", "candidate_database", "database")):
 		manifest, discovered = build_auto_manifest(cp, dag_dir)
 	elif cp.has_section("injections") and cp.has_option("injections", "manifest"):
 		log(f"reading explicit manifest: {cp.get('injections', 'manifest')}")
@@ -350,7 +393,7 @@ def main():
 	else:
 		sections = ", ".join(cp.sections()) or "none"
 		raise ValueError(
-			"config must either define [gstlal] run_dir and injection_database "
+			"config must either define [gstlal] run_dir and a database "
 			"for auto mode, or [injections] manifest for explicit mode. "
 			f"Parsed sections: {sections}. Config path: {os.path.abspath(args.config)}"
 		)
