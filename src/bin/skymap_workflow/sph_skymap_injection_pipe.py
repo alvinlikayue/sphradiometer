@@ -256,7 +256,9 @@ def build_auto_manifest(cp, dag_dir):
 		)
 		rows = diagnostics.query_noise_candidates_from_sqlite(manifest_cp)
 		log(f"selected {len(rows)} noise/candidate rows from SQLite")
+		log("resolving noise candidates to SVD bank rows and reference PSDs")
 		manifest_rows = diagnostics.make_noise_candidate_manifest_rows(manifest_cp, rows)
+		log(f"resolved {len(manifest_rows)} noise/candidate manifest rows")
 		bank_map_path = ""
 	else:
 		manifest_cp.set("manifest", "injection_xml", discover_first_existing(run_dir, ["bbh_injections.xml", "injections.xml"]))
