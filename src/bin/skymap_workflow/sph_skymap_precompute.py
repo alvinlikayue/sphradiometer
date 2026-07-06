@@ -80,7 +80,6 @@ def main():
 			args.precalc_len,
 			args.delta_t,
 			effective_sample_rate=args.effective_sample_rate,
-			apply_projection=args.apply_projection,
 		)
 		loc.write(combo_dir)
 	else:
@@ -89,7 +88,6 @@ def main():
 			args.precalc_len,
 			args.delta_t,
 			effective_sample_rate=args.effective_sample_rate,
-			apply_projection=args.apply_projection,
 		)
 		loc.write(args.output_dir)
 

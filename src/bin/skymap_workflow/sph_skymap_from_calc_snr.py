@@ -114,21 +114,21 @@ def build_common_window(full, aut, center_time, pre_trigger, start_idx_override=
 	return snr, dt
 
 
-def coeff_series_to_prob(series):
-	_, _, log_prob = sph_healpix.healpy_alm_to_map(*sph_healpix.sh_series_to_healpy_alm(series.get()))
+def coeff_series_to_prob(series, nside=None):
+	alms, l_max, m_max = sph_healpix.sh_series_to_healpy_alm(series.get())
+	if nside is None:
+		_, _, log_prob = sph_healpix.healpy_alm_to_map(alms, l_max, m_max)
+	else:
+		log_prob = hp.alm2map(alms, nside, l_max, m_max)
 	prob = np.exp(log_prob - log_prob.max())
 	prob /= np.sum(prob)
 	return prob
 
 
-def derotate_to_celestial(series, gmst):
-	source = series.get()
-	rotated = sph.sh_series_new_zero(source.l_max, source.polar)
-	sph.sh_series_rotate_z(rotated, source, -gmst)
-	if series.ndet > 1:
-		sph.sh_seriespp_assign(series.coeff, rotated)
-	else:
-		sph.sh_seriesp_assign(series.coeff, rotated)
+def coeff_pair_to_prob(series_p, series_n, nside=None):
+	prob_p = coeff_series_to_prob(series_p, nside=nside)
+	prob_n = coeff_series_to_prob(series_n, nside=nside)
+	return (prob_p + prob_n) / 2.0
 
 
 def write_prob_fits(prob, path):
@@ -168,8 +168,13 @@ def main():
 	parser.add_argument("--effective-sample-rate", type=int, default=512)
 	parser.add_argument("--scale-power", type=float, default=0.6)
 	parser.add_argument("--scale-overall", type=float, default=2.7)
+	parser.add_argument("--output-nside", type=int, help="HEALPix nside for the output map; default is derived from l_max")
 	parser.add_argument("--include-whitening", action="store_true")
-	parser.add_argument("--no-derotate", action="store_true")
+	parser.add_argument(
+		"--no-derotate",
+		action="store_true",
+		help="deprecated no-op; Kipp's harmonic backend already returns celestial coordinates",
+	)
 	parser.add_argument("--timing", action="store_true")
 	args = parser.parse_args()
 
@@ -193,7 +198,7 @@ def main():
 
 	instruments = sorted(snr)
 	if args.precalc_dir:
-		loc = RapidLocalization.read(args.precalc_dir, instruments=instruments)
+		loc = RapidLocalization.read(args.precalc_dir)
 	else:
 		if not args.psd_xml:
 			raise ValueError("--psd-xml is required when --precalc-dir is not provided")
@@ -206,14 +211,10 @@ def main():
 			aut,
 			power=args.scale_power,
 			overall=args.scale_overall,
-			include_whitening=args.include_whitening,
 		)
-	if not args.no_derotate:
-		gmst = lal.GreenwichMeanSiderealTime(lal.LIGOTimeGPS(args.center_time))
-		derotate_to_celestial(skyp, gmst)
-		derotate_to_celestial(skyn, gmst)
-
 	sky = rapidskyloc_io(skyp, skyn, coinc_event_id=args.coinc_event_id)
+	if args.output_nside:
+		sky.prob = coeff_pair_to_prob(skyp, skyn, nside=args.output_nside)
 	os.makedirs(os.path.dirname(os.path.abspath(args.output_fits)), exist_ok=True)
 	if args.output_coeff_p:
 		os.makedirs(os.path.dirname(os.path.abspath(args.output_coeff_p)), exist_ok=True)
@@ -230,9 +231,9 @@ def main():
 	print("wrote", args.output_fits, "npix", len(sky.prob), "sum", float(np.sum(sky.prob)))
 
 	if args.output_fits_p:
-		write_prob_fits(coeff_series_to_prob(skyp), args.output_fits_p)
+		write_prob_fits(coeff_series_to_prob(skyp, nside=args.output_nside), args.output_fits_p)
 	if args.output_fits_n:
-		write_prob_fits(coeff_series_to_prob(skyn), args.output_fits_n)
+		write_prob_fits(coeff_series_to_prob(skyn, nside=args.output_nside), args.output_fits_n)
 	timer.report()
 
 
