@@ -149,6 +149,7 @@ struct correlator_network_plan_td {
 struct correlator_network_plan_fd {
 	struct correlator_network_baselines *baselines;
 	struct correlator_plan_fd **plans;
+	int swap_frequency_product;
 };
 
 
@@ -253,6 +254,8 @@ struct correlator_network_plan_fd *correlator_network_plan_fd_new(struct correla
 void correlator_network_plan_fd_free(struct correlator_network_plan_fd *);
 struct correlator_network_plan_fd *correlator_network_plan_fd_copy(const struct correlator_network_plan_fd *);
 struct correlator_network_plan_fd *correlator_network_plan_fd_set_l(struct correlator_network_plan_fd *, unsigned);
+struct correlator_network_plan_fd *correlator_network_plan_fd_set_swap_frequency_product(struct correlator_network_plan_fd *, int);
+struct correlator_network_plan_fd *correlator_network_plan_fd_set_frame_gmst(struct correlator_network_plan_fd *, double);
 
 
 /*
@@ -264,12 +267,14 @@ struct sh_series *correlator_baseline_integrate_power_td(const double *, const d
 
 
 struct sh_series *correlator_baseline_integrate_power_fd(const double complex *, const double complex *, struct correlator_plan_fd *);
+struct sh_series *correlator_baseline_integrate_power_fd_window(const double complex *, const double complex *, const double complex *, struct correlator_plan_fd *);
 
 
 struct sh_series *correlator_network_integrate_power_td(struct sh_series *, double **, int, double **, struct correlator_network_plan_td *);
 
 
 struct sh_series *correlator_network_integrate_power_fd(struct sh_series *, double complex **, struct correlator_network_plan_fd *);
+struct sh_series *correlator_network_integrate_power_fd_window(struct sh_series *, double complex **, const double complex *, struct correlator_network_plan_fd *);
 
 
 #ifdef __cplusplus

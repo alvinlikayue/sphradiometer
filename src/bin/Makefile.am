@@ -5,9 +5,11 @@ bin_PROGRAMS = \
 	sphradiometer_demo
 
 dist_bin_SCRIPTS = \
+	skymap_workflow/sph_bayestar_from_sqlite.py \
 	skymap_workflow/sph_skymap_common.py \
 	skymap_workflow/sph_skymap_from_calc_snr.py \
 	skymap_workflow/sph_skymap_injection_pipe.py \
+	skymap_workflow/sph_skymap_injection_summary.py \
 	skymap_workflow/sph_skymap_precompute.py \
 	skymap_workflow/sph_skymap_precompute_pipe.py \
 	skymap_workflow/sph_spherical_harmonic_coeff_summary.py

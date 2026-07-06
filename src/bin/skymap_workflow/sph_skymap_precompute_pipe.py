@@ -98,6 +98,8 @@ def main():
 			"--sample-rate": cp.get("precompute", "sample_rate", fallback="2048"),
 			"--effective-sample-rate": cp.get("precompute", "effective_sample_rate", fallback="512"),
 		}
+		if getboolean(cp, "precompute", "apply_projection", fallback=False):
+			opts["--apply-projection"] = ""
 		if getboolean(cp, "precompute", "force", fallback=True):
 			opts["--force"] = ""
 		opts_list.append(opts)

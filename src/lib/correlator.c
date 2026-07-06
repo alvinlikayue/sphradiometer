@@ -711,6 +711,50 @@ struct sh_series *correlator_baseline_integrate_power_fd(const complex double *f
 }
 
 
+struct sh_series *correlator_baseline_integrate_power_fd_window(const complex double *freq_series_a, const complex double *freq_series_b, const complex double *window, struct correlator_plan_fd *plan)
+{
+	struct sh_series *power_2d;
+	struct sh_series_array *power_t;
+	int i;
+
+	if(!window)
+		return correlator_baseline_integrate_power_fd(freq_series_a, freq_series_b, plan);
+
+	/* multiply the two frequency series */
+	for(i = 0; i < plan->delay_product->n; i++)
+		plan->fseries_product[i] = *freq_series_b++ * conj(*freq_series_a++);
+
+	/* Leave the frequency-bin contributions un-summed, transform the
+	 * sky coefficients back to the cross-power time domain, and apply
+	 * the requested geocentric-time window before summing. */
+	power_t = sh_series_array_copy(plan->delay_product);
+	if(!power_t)
+		return NULL;
+	if(!sh_series_array_windowc(power_t, plan->fseries_product)) {
+		sh_series_array_free(power_t);
+		return NULL;
+	}
+	if(!sh_series_array_reverse_fft(power_t)) {
+		sh_series_array_free(power_t);
+		return NULL;
+	}
+	if(!sh_series_array_dotc(plan->power_1d, power_t, window)) {
+		sh_series_array_free(power_t);
+		return NULL;
+	}
+	sh_series_array_free(power_t);
+
+	/* Match the normalization used by the unwindowed FD correlator. */
+	sh_series_scale(plan->power_1d, 1.0 / plan->delay_product->n);
+
+	power_2d = sh_series_new(plan->power_1d->l_max, 0);
+	if(!power_2d || !sh_series_rotate(power_2d, plan->power_1d, plan->rotation_plan))
+		return NULL;
+
+	return power_2d;
+}
+
+
 /*
  * ============================================================================
  *
@@ -888,6 +932,7 @@ struct correlator_network_plan_fd *correlator_network_plan_fd_new(struct correla
 
 	new->baselines = baselines;
 	new->plans = plans;
+	new->swap_frequency_product = 0;
 
 	return new;
 }
@@ -959,6 +1004,36 @@ struct correlator_network_plan_fd *correlator_network_plan_fd_set_l(struct corre
 }
 
 
+struct correlator_network_plan_fd *correlator_network_plan_fd_set_swap_frequency_product(struct correlator_network_plan_fd *plan, int swap_frequency_product)
+{
+	plan->swap_frequency_product = swap_frequency_product ? 1 : 0;
+	return plan;
+}
+
+
+struct correlator_network_plan_fd *correlator_network_plan_fd_set_frame_gmst(struct correlator_network_plan_fd *plan, double frame_gmst)
+{
+	int i;
+
+	for(i = 0; i < plan->baselines->n_baselines; i++) {
+		const struct correlator_baseline *baseline = plan->baselines->baselines[i];
+		double *R = sh_series_rot_matrix(baseline->theta, baseline->phi + frame_gmst);
+		struct sh_series_rotation_plan *rotation_plan;
+
+		if(!R)
+			return NULL;
+		rotation_plan = sh_series_rotation_plan_new(plan->plans[i]->power_1d, R);
+		free(R);
+		if(!rotation_plan)
+			return NULL;
+		sh_series_rotation_plan_free(plan->plans[i]->rotation_plan);
+		plan->plans[i]->rotation_plan = rotation_plan;
+	}
+
+	return plan;
+}
+
+
 /*
  * Time-domain network correlator
  */
@@ -990,7 +1065,7 @@ struct sh_series *correlator_network_integrate_power_td(struct sh_series *sky, d
  */
 
 
-struct sh_series *correlator_network_integrate_power_fd(struct sh_series *sky, complex double **fseries, struct correlator_network_plan_fd *plan)
+static struct sh_series *correlator_network_integrate_power_fd_internal(struct sh_series *sky, complex double **fseries, const complex double *window, struct correlator_network_plan_fd *plan)
 {
 	int i, j, k;
 
@@ -998,7 +1073,13 @@ struct sh_series *correlator_network_integrate_power_fd(struct sh_series *sky, c
 	k = 0;
 	for(i = 1; i < instrument_array_len(plan->baselines->baselines[0]->instruments); i++)
 		for(j = 0; j < i; j++, k++) {
-			struct sh_series *power_2d = correlator_baseline_integrate_power_fd(fseries[i], fseries[j], plan->plans[k]);
+			struct sh_series *power_2d;
+			const complex double *a = plan->swap_frequency_product ? fseries[j] : fseries[i];
+			const complex double *b = plan->swap_frequency_product ? fseries[i] : fseries[j];
+			if(window)
+				power_2d = correlator_baseline_integrate_power_fd_window(a, b, window, plan->plans[k]);
+			else
+				power_2d = correlator_baseline_integrate_power_fd(a, b, plan->plans[k]);
 			if(!power_2d)
 				return NULL;
 			if(!sh_series_add(sky, 1.0 / plan->baselines->n_baselines, power_2d))
@@ -1009,3 +1090,16 @@ struct sh_series *correlator_network_integrate_power_fd(struct sh_series *sky, c
 	return sky;
 }
 
+
+struct sh_series *correlator_network_integrate_power_fd(struct sh_series *sky, complex double **fseries, struct correlator_network_plan_fd *plan)
+{
+	return correlator_network_integrate_power_fd_internal(sky, fseries, NULL, plan);
+}
+
+
+struct sh_series *correlator_network_integrate_power_fd_window(struct sh_series *sky, complex double **fseries, const complex double *window, struct correlator_network_plan_fd *plan)
+{
+	if(!window)
+		return correlator_network_integrate_power_fd(sky, fseries, plan);
+	return correlator_network_integrate_power_fd_internal(sky, fseries, window, plan);
+}

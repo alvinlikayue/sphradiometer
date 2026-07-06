@@ -9,6 +9,7 @@ import importlib.util
 import os
 import re
 import shutil
+import sqlite3
 
 from lal.utils import CacheEntry
 import ligolw.utils
@@ -60,7 +61,13 @@ def split_combo(combo):
 
 
 def combo_from_ifos(ifos):
-	return "".join(sorted(ifos))
+	return "".join(sorted(ifo.strip() for ifo in ifos if ifo.strip()))
+
+
+def canonical_combo(combo):
+	if "," in combo:
+		return combo_from_ifos(combo.split(","))
+	return combo_from_ifos(split_combo(combo))
 
 
 def discover_channels(run_dir):
@@ -95,7 +102,60 @@ def parse_channel_map(channel_string):
 
 
 def channels_for_combo(channel_map, combo):
-	return [f"{ifo}={channel_map[ifo]}" for ifo in split_combo(combo)]
+	return [f"{ifo}={channel_map[ifo]}" for ifo in split_combo(canonical_combo(combo))]
+
+
+def skymap_backend(cp):
+	backend = cp.get("skymap", "backend", fallback="coherent_likelihood").strip().lower()
+	aliases = {
+		"harmonic": "harmonic",
+		"spherical_harmonic": "harmonic",
+		"sph": "harmonic",
+		"direct": "direct_time_prior",
+		"direct_time": "direct_time_prior",
+		"direct_time_prior": "direct_time_prior",
+		"coherent_likelihood": "coherent_likelihood",
+		"coherent": "coherent_likelihood",
+		"coherent_cbc": "coherent_likelihood",
+	}
+	if backend not in aliases:
+		raise ValueError("[skymap] backend must be 'harmonic', 'direct_time_prior', or 'coherent_likelihood'")
+	return aliases[backend]
+
+
+def row_skymap_backend(cp, backend, instruments):
+	if backend == "harmonic" and len(split_combo(instruments)) < 3:
+		fallback = cp.get("skymap", "low_ifo_backend", fallback="coherent_likelihood").strip().lower()
+		if fallback in ("", "harmonic", "none", "off", "false"):
+			return backend
+		fallback_cp = configparser.ConfigParser()
+		fallback_cp.add_section("skymap")
+		fallback_cp.set("skymap", "backend", fallback)
+		return skymap_backend(fallback_cp)
+	return backend
+
+
+def resolve_time_prior_center(cp, row):
+	setting = cp.get("skymap", "time_prior_center", fallback="auto").strip()
+	if setting.lower() in ("", "auto"):
+		return row["center_time"]
+	if setting.lower() in ("simulation_time", "truth"):
+		return row.get("simulation_time") or row["center_time"]
+	if setting.lower() == "center_time":
+		return row["center_time"]
+	return setting
+
+
+def resolve_time_prior_half_width(cp, row):
+	setting = cp.get("skymap", "time_prior_half_width", fallback="0.008").strip()
+	if setting.lower() in ("snr_window", "full_snr_window"):
+		if row.get("snr_start") and row.get("snr_end"):
+			center = float(resolve_time_prior_center(cp, row))
+			return str(max(abs(center - float(row["snr_start"])), abs(float(row["snr_end"]) - center)))
+		return "0.008"
+	if setting.lower() in ("", "auto"):
+		return "0.008"
+	return setting
 
 
 def discover_first_existing(run_dir, names):
@@ -104,6 +164,30 @@ def discover_first_existing(run_dir, names):
 		if os.path.exists(path):
 			return path
 	return ""
+
+
+def configured_gstlal_database(cp):
+	if not cp.has_section("gstlal"):
+		return ""
+	for option in ("injection_database", "noise_database", "candidate_database", "database"):
+		if cp.has_option("gstlal", option) and cp.get("gstlal", option).strip():
+			return abs_if_set(cp.get("gstlal", option))
+	return ""
+
+
+def prepare_bayestar_sqlite(input_sqlite, output_sqlite, f_final):
+	if not input_sqlite:
+		raise ValueError("[bayestar] enabled requires [bayestar] database or a [gstlal] database")
+	os.makedirs(os.path.dirname(os.path.abspath(output_sqlite)), exist_ok=True)
+	if os.path.abspath(input_sqlite) != os.path.abspath(output_sqlite):
+		shutil.copy2(input_sqlite, output_sqlite)
+	with sqlite3.connect(output_sqlite) as conn:
+		columns = {row[1] for row in conn.execute("PRAGMA table_info(sngl_inspiral)")}
+		if "f_final" not in columns:
+			conn.execute("ALTER TABLE sngl_inspiral ADD COLUMN f_final REAL")
+		conn.execute("UPDATE sngl_inspiral SET f_final = ? WHERE f_final IS NULL OR f_final <= 0", (float(f_final),))
+		conn.commit()
+	return output_sqlite
 
 
 def discover_template_match_files(run_dir):
@@ -120,7 +204,7 @@ def discover_svd_bank_strings_by_combo(run_dir):
 	svd_banks = {}
 	for pattern in cache_patterns:
 		for cache in sorted(glob.glob(pattern)):
-			combo = os.path.basename(cache).split("-")[0]
+			combo = canonical_combo(os.path.basename(cache).split("-")[0])
 			for svd_bank in diagnostics.svd_bank_strings_from_cache(cache):
 				svd_banks.setdefault(combo, [])
 				if svd_bank not in svd_banks[combo]:
@@ -133,7 +217,7 @@ def discover_svd_bank_strings_by_combo(run_dir):
 def discover_reference_psds_by_combo(run_dir):
 	psds = {}
 	for path in glob.glob(os.path.join(run_dir, "gstlal_reference_psd", "*", "*-REFERENCE_PSD-*.xml.gz")):
-		combo = os.path.basename(path).split("-")[0]
+		combo = canonical_combo(os.path.basename(path).split("-")[0])
 		try:
 			entry = CacheEntry.from_T050017(path)
 			psds.setdefault(combo, []).append((float(entry.segment[0]), float(entry.segment[1]), path))
@@ -233,8 +317,8 @@ def build_auto_manifest(cp, dag_dir):
 	manifest_cp.set("manifest", "order_by", cp.get("manifest", "order_by", fallback="far"))
 	manifest_cp.set("manifest", "order", cp.get("manifest", "order", fallback="asc"))
 	manifest_cp.set("manifest", "limit", cp.get("manifest", "limit", fallback=""))
-	manifest_cp.set("manifest", "allow_missing_bank_rows", "false")
-	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where", "instruments", "exclude_time_windows", "exclude_injection_associations", "zero_lag_only"):
+	manifest_cp.set("manifest", "allow_missing_bank_rows", cp.get("manifest", "allow_missing_bank_rows", fallback="false"))
+	for key in ("far_lt", "far_lte", "far_gt", "far_gte", "snr_lt", "snr_lte", "snr_gt", "snr_gte", "likelihood_lt", "likelihood_lte", "likelihood_gt", "likelihood_gte", "where", "instruments", "exclude_time_windows", "exclude_injection_associations", "zero_lag_only", "max_time_offset"):
 		if cp.has_option("manifest", key):
 			manifest_cp.set("manifest", key, cp.get("manifest", key))
 	for key, fallback in (("gps_pad", "70"), ("snr_pad", "1"), ("pre_trigger", "0.12"), ("row_counts", "1")):
@@ -272,64 +356,27 @@ def build_auto_manifest(cp, dag_dir):
 		)
 		rows = diagnostics.query_recovered_injections_from_sqlite(manifest_cp)
 		log(f"selected {len(rows)} recovered injection rows from SQLite")
-		log("loading detector data segments")
-		segments_by_ifo = load_segments_by_ifo(segments_xml)
-		row_combo_by_time = {}
-		gps_pad = float(manifest_cp.get("manifest", "gps_pad"))
-		for row in rows:
-			center = float(row["center_time"])
-			ifos = ifos_covering_interval(segments_by_ifo, int(center - gps_pad), int(center + gps_pad + 0.999999))
-			if len(ifos) < int(cp.get("manifest", "min_ifo", fallback="1")):
-				continue
-			row_combo_by_time[diagnostics._format_float(row["simulation_time"])] = combo_from_ifos(ifos)
-		combo_counts = {}
-		for combo in row_combo_by_time.values():
-			combo_counts[combo] = combo_counts.get(combo, 0) + 1
-		log("selected rows by detector combo: " + ", ".join(f"{combo}={count}" for combo, count in sorted(combo_counts.items())))
-		simulation_id_by_time = {
-			diagnostics._format_float(row["simulation_time"]): str(row["simulation_id"])
-			for row in rows
-			if diagnostics._format_float(row["simulation_time"]) in row_combo_by_time
-		}
-		log("discovering injection-template-match XML files")
-		template_match_files = discover_template_match_files(run_dir)
-		log(f"found {len(template_match_files)} injection-template-match XML files")
-		log("discovering SVD bank groups")
-		svd_banks_by_combo = discover_svd_bank_strings_by_combo(run_dir)
-		log("found SVD bank group strings by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(svd_banks_by_combo.items())))
-		log("matching selected injections to SVD bank rows by geocentric time")
-		bank_map_rows = []
-		for combo in sorted(set(row_combo_by_time.values())):
-			combo_times = [time for time, row_combo in row_combo_by_time.items() if row_combo == combo]
-			if combo not in svd_banks_by_combo:
-				raise FileNotFoundError(f"no SVD bank caches found for detector combo {combo}")
-			combo_rows = diagnostics.scan_template_match_svd_bank_rows(
-				template_match_files,
-				svd_banks_by_combo[combo],
-				simulation_times=combo_times,
-			)
-			for row in combo_rows:
-				row["instruments"] = combo
-				row["channel_name"] = ",".join(channels_for_combo(channel_map, combo))
-			bank_map_rows.extend(combo_rows)
-		log(f"matched {len(bank_map_rows)} injections to SVD bank rows")
-		for row in bank_map_rows:
-			row["simulation_id"] = simulation_id_by_time[row["simulation_time"]]
-		bank_map_path = os.path.join(output_root, "bank_row_map.csv")
-		diagnostics.write_bank_row_map(bank_map_rows, bank_map_path)
-		log(f"wrote bank-row map: {bank_map_path}")
-		manifest_cp.set("manifest", "bank_row_map", bank_map_path)
+		min_ifo = int(cp.get("manifest", "min_ifo", fallback="1"))
 		rows = [
 			row for row in rows
-			if diagnostics._format_float(row["simulation_time"]) in simulation_id_by_time
+			if len(row["instruments"].split(",")) >= min_ifo
 		]
+		combo_counts = {}
+		for row in rows:
+			combo = combo_from_ifos(row["instruments"].split(","))
+			combo_counts[combo] = combo_counts.get(combo, 0) + 1
+		log("selected rows by detector combo: " + ", ".join(f"{combo}={count}" for combo, count in sorted(combo_counts.items())))
+		bank_map_path = ""
+		log("resolving recovered injection triggers to SVD bank rows and reference PSDs")
 		manifest_rows = diagnostics.make_injection_manifest_rows(manifest_cp, rows)
+		log(f"resolved {len(manifest_rows)} recovered injection manifest rows")
 		log("discovering reference PSD files")
 		psds_by_combo = discover_reference_psds_by_combo(run_dir)
 		log("found reference PSD files by combo: " + ", ".join(f"{combo}={len(values)}" for combo, values in sorted(psds_by_combo.items())))
 		log("assigning reference PSD to each manifest row")
 		for row in manifest_rows:
-			combo = row["instruments"]
+			combo = canonical_combo(row["instruments"])
+			row["instruments"] = combo
 			if combo not in psds_by_combo:
 				raise FileNotFoundError(f"no reference PSD files found for detector combo {combo}")
 			row["reference_psd"] = choose_reference_psd(psds_by_combo[combo], row["center_time"])
@@ -373,6 +420,7 @@ def main():
 	output_root = os.path.join(dag_dir, "outputs")
 	calc_snr_root = os.path.join(output_root, "calc_snr")
 	skymap_root = os.path.join(output_root, "skymap")
+	bayestar_root = os.path.join(output_root, "bayestar")
 	skymap_branch_root = os.path.join(output_root, "skymap_branch")
 	coeff_root = os.path.join(output_root, "coeff")
 	log(f"reading config: {os.path.abspath(args.config)}")
@@ -383,6 +431,7 @@ def main():
 	os.makedirs(output_root, exist_ok=True)
 	os.makedirs(calc_snr_root, exist_ok=True)
 	os.makedirs(skymap_root, exist_ok=True)
+	os.makedirs(bayestar_root, exist_ok=True)
 	os.makedirs(skymap_branch_root, exist_ok=True)
 	os.makedirs(coeff_root, exist_ok=True)
 
@@ -422,12 +471,40 @@ def main():
 			output_path=os.path.join(dag_dir, "sph_skymap_from_calc_snr"),
 			**condor_opts,
 		)
+		bayestar_layer = base_htcondor_layer(
+			executable=executable("sph_bayestar_from_sqlite.py"),
+			node_name="sph_bayestar_from_sqlite",
+			output_path=os.path.join(dag_dir, "sph_bayestar_from_sqlite"),
+			**condor_opts,
+		)
 
 	channel_names = split_channels(cp.get("data", "channel_name", fallback=discovered.get("channel_name", "")))
 	if not channel_names:
 		raise ValueError("channel names were not configured or discovered")
 	log(f"using {len(channel_names)} channels: {', '.join(channel_names)}")
 	svd_banks = cp.get("data", "svd_bank", fallback="")
+	backend = skymap_backend(cp)
+	log(f"using skymap backend: {backend}")
+	write_coefficients = cp.getboolean("skymap", "write_coefficients", fallback=True)
+	log(f"writing coefficient FITS files: {write_coefficients}")
+	write_branch_maps = cp.getboolean("skymap", "write_branch_maps", fallback=True)
+	log(f"writing p/n branch FITS files: {write_branch_maps}")
+	write_png = cp.getboolean("skymap", "write_png", fallback=True)
+	log(f"writing PNG plots: {write_png}")
+	skymap_timing = cp.getboolean("skymap", "timing", fallback=False)
+	log(f"printing skymap timing: {skymap_timing}")
+	run_bayestar = cp.getboolean("bayestar", "enabled", fallback=False)
+	bayestar_write_png = cp.getboolean("bayestar", "write_png", fallback=True)
+	bayestar_database = ""
+	if run_bayestar:
+		bayestar_database = abs_if_set(cp.get("bayestar", "database", fallback="")) or configured_gstlal_database(cp)
+		bayestar_database = prepare_bayestar_sqlite(
+			bayestar_database,
+			os.path.join(bayestar_root, "input_with_f_final.sqlite"),
+			cp.get("bayestar", "f_final", fallback="1024"),
+		)
+		log(f"prepared BAYESTAR input SQLite: {bayestar_database}")
+		log(f"writing BAYESTAR PNG plots: {bayestar_write_png}")
 	precalc_dir = abs_if_set(cp.get("skymap", "precalc_dir", fallback=""))
 	psd_xml = abs_if_set(cp.get("data", "reference_psd", fallback=discovered.get("reference_psd", "")))
 	global_injection_xml = abs_if_set(cp.get("injections", "injection_xml", fallback=discovered.get("injection_xml", "")))
@@ -440,6 +517,9 @@ def main():
 	calc_io_list = []
 	map_opts_list = []
 	map_io_list = []
+	bayestar_opts_list = []
+	bayestar_io_list = []
+	map_backend_counts = {}
 
 	for row in manifest:
 		sim_id = row.get("simulation_id") or row.get("id")
@@ -454,6 +534,8 @@ def main():
 		coeff_p = os.path.join(coeff_root, f"{tag}_coeffp.fits")
 		coeff_n = os.path.join(coeff_root, f"{tag}_coeffn.fits")
 		png = os.path.join(skymap_root, f"{tag}.png")
+		bayestar_fits = os.path.join(bayestar_root, f"{tag}_bayestar.fits")
+		bayestar_png = os.path.join(bayestar_root, f"{tag}_bayestar.png")
 
 		row_psd = abs_if_set(row.get("reference_psd", "")) or psd_xml
 		row_svd_bank = row.get("svd_bank", "") or svd_banks
@@ -514,14 +596,18 @@ def main():
 		calc_opts_list.append(calc_opts)
 		calc_io_list.append({"inputs": calc_inputs, "outputs": [calc_dir]})
 
+		this_backend = row_skymap_backend(cp, backend, row.get("instruments", ""))
+		map_backend_counts[this_backend] = map_backend_counts.get(this_backend, 0) + 1
+		adaptive_row = (
+			this_backend == "coherent_likelihood"
+			and cp.getboolean("skymap", "adaptive", fallback=False)
+			and len(split_combo(row.get("instruments", ""))) > 1
+		)
+
 		map_opts = {
 			"--calc-snr-dir": calc_dir,
 			"--output-fits": fits,
-			"--output-fits-p": fits_p,
-			"--output-fits-n": fits_n,
-			"--output-coeff-p": coeff_p,
-			"--output-coeff-n": coeff_n,
-			"--output-png": png,
+			"--instruments": ",".join(split_combo(row.get("instruments", ""))),
 			"--bank-number": row["bank_number"],
 			"--row-number": row["row_number"],
 			"--coinc-event-id": row.get("coinc_event_id", sim_id),
@@ -535,27 +621,200 @@ def main():
 			"--dec-deg": row.get("dec_deg", ""),
 			"--contour": cp.get("skymap", "contour", fallback="50 90"),
 		}
-		if precalc_dir:
-			map_opts["--precalc-dir"] = precalc_dir
+		map_inputs = [calc_dir]
+		map_outputs = [fits]
+		if write_png:
+			map_opts["--output-png"] = png
+			map_outputs.append(png)
+		if write_branch_maps and not adaptive_row:
+			map_opts["--output-fits-p"] = fits_p
+			map_opts["--output-fits-n"] = fits_n
+			map_outputs.extend([fits_p, fits_n])
+		if write_coefficients and not adaptive_row:
+			map_opts["--output-coeff-p"] = coeff_p
+			map_opts["--output-coeff-n"] = coeff_n
+			map_outputs.extend([coeff_p, coeff_n])
 		else:
-			map_opts["--psd-xml"] = row_psd
+			map_opts["--no-output-coefficients"] = ""
+
+		if this_backend in ("direct_time_prior", "coherent_likelihood"):
+			if this_backend == "direct_time_prior":
+				map_opts["--direct-time-prior"] = ""
+				map_opts["--direct-smoothing-deg"] = cp.get("skymap", "direct_smoothing_deg", fallback="0.0")
+			else:
+				map_opts["--coherent-likelihood"] = ""
+				map_opts["--paper-fmin"] = cp.get("skymap", "paper_fmin", fallback="0.0")
+				map_opts["--paper-fmax"] = cp.get("skymap", "paper_fmax", fallback="512.0")
+				map_opts["--paper-autocorr-floor"] = cp.get("skymap", "paper_autocorr_floor", fallback="1e-6")
+				map_opts["--paper-snr-window"] = cp.get("skymap", "paper_snr_window", fallback="full")
+				map_opts["--amplitude-model"] = cp.get("skymap", "amplitude_model", fallback="paper_cross")
+				if cp.get("skymap", "peak_time_sigma", fallback="").strip():
+					map_opts["--peak-time-sigma"] = cp.get("skymap", "peak_time_sigma")
+					if cp.get("skymap", "peak_time_min_snr", fallback="").strip():
+						map_opts["--peak-time-min-snr"] = cp.get("skymap", "peak_time_min_snr")
+					if cp.get("skymap", "peak_time_min_peak_abs", fallback="").strip():
+						map_opts["--peak-time-min-peak-abs"] = cp.get("skymap", "peak_time_min_peak_abs")
+					if cp.get("skymap", "peak_time_min_prominence", fallback="").strip():
+						map_opts["--peak-time-min-prominence"] = cp.get("skymap", "peak_time_min_prominence")
+					if cp.get("skymap", "peak_time_uncertainty_model", fallback="").strip():
+						map_opts["--peak-time-uncertainty-model"] = cp.get("skymap", "peak_time_uncertainty_model")
+					if cp.get("skymap", "peak_time_reference_peak_abs", fallback="").strip():
+						map_opts["--peak-time-reference-peak-abs"] = cp.get("skymap", "peak_time_reference_peak_abs")
+					if cp.get("skymap", "peak_time_uncertainty_power", fallback="").strip():
+						map_opts["--peak-time-uncertainty-power"] = cp.get("skymap", "peak_time_uncertainty_power")
+						if cp.get("skymap", "peak_time_max_sigma", fallback="").strip():
+							map_opts["--peak-time-max-sigma"] = cp.get("skymap", "peak_time_max_sigma")
+					map_opts["--inclination-samples"] = cp.get("skymap", "inclination_samples", fallback="5")
+					map_opts["--polarization-samples"] = cp.get("skymap", "polarization_samples", fallback="4")
+				if cp.getboolean("skymap", "paper_flat_noise", fallback=False):
+					map_opts["--paper-flat-noise"] = ""
+				if cp.getboolean("skymap", "paper_delta_template", fallback=False):
+					map_opts["--paper-delta-template"] = ""
+				if cp.getboolean("skymap", "paper_no_shift_autocorr", fallback=False):
+					map_opts["--paper-no-shift-autocorr"] = ""
+				if adaptive_row:
+					map_opts["--adaptive"] = ""
+					map_opts["--adaptive-nside-stop"] = cp.get("skymap", "adaptive_nside_stop", fallback="256")
+					map_opts["--adaptive-refine-top-pixels"] = cp.get("skymap", "adaptive_refine_top_pixels", fallback="128")
+					map_opts["--adaptive-refine-probability"] = cp.get("skymap", "adaptive_refine_probability", fallback="0.0")
+					map_opts["--adaptive-max-evals"] = cp.get("skymap", "adaptive_max_evals", fallback="20000")
+					if cp.getboolean("skymap", "adaptive_refine_neighbors", fallback=False):
+						map_opts["--adaptive-refine-neighbors"] = ""
+			map_opts["--direct-score-scale"] = cp.get("skymap", "direct_score_scale", fallback="-1")
+			for option in (
+				"snr_ramp_low_snr",
+				"snr_ramp_high_snr",
+				"snr_ramp_two_ifo_cap",
+				"snr_ramp_multi_ifo_cap",
+			):
+				if cp.get("skymap", option, fallback="").strip():
+					map_opts["--" + option.replace("_", "-")] = cp.get("skymap", option)
+			map_opts["--isotropic-mixture"] = cp.get("skymap", "isotropic_mixture", fallback="0.0")
+			map_opts["--antenna-mixture"] = cp.get("skymap", "antenna_mixture", fallback="0.0")
+			map_opts["--direct-smoothing-deg"] = cp.get("skymap", "direct_smoothing_deg", fallback="0.0")
+			if row.get("snr"):
+				map_opts["--network-snr"] = row["snr"]
+			if cp.getboolean("skymap", "containment_calibration", fallback=False):
+				map_opts["--containment-calibration"] = ""
+				for option in (
+					"low_snr_threshold",
+					"low_snr_score_scale",
+					"low_snr_smoothing_deg",
+					"low_snr_isotropic_mixture",
+					"low_snr_antenna_mixture",
+					"high_snr_threshold",
+					"high_snr_score_scale",
+					"high_snr_smoothing_deg",
+					"high_snr_isotropic_mixture",
+					"high_snr_antenna_mixture",
+				):
+					if cp.get("skymap", option, fallback="").strip():
+						map_opts["--" + option.replace("_", "-")] = cp.get("skymap", option)
+			map_opts["--direct-nside"] = cp.get("skymap", "direct_nside", fallback="32")
+			map_opts["--time-prior-center"] = resolve_time_prior_center(cp, row)
+			map_opts["--time-prior-half-width"] = resolve_time_prior_half_width(cp, row)
+			if cp.get("skymap", "time_prior_step", fallback="").strip():
+				map_opts["--time-prior-step"] = cp.get("skymap", "time_prior_step")
+			if cp.get("skymap", "direct_coeff_lmax", fallback="").strip():
+				map_opts["--direct-coeff-lmax"] = cp.get("skymap", "direct_coeff_lmax")
+			if cp.get("skymap", "direct_coeff_log_floor", fallback="").strip():
+				map_opts["--direct-coeff-log-floor"] = cp.get("skymap", "direct_coeff_log_floor")
+			if row_psd:
+				map_opts["--psd-xml"] = row_psd
+				map_inputs.append(row_psd)
+		else:
+			if precalc_dir:
+				map_opts["--precalc-dir"] = precalc_dir
+				map_inputs.append(precalc_dir)
+			else:
+				map_opts["--psd-xml"] = row_psd
+				map_inputs.append(row_psd)
+			if cp.getboolean("skymap", "runtime_gmst_correction", fallback=False):
+				map_opts["--runtime-projection-gmst"] = ""
+				runtime_projection_mode = cp.get("skymap", "runtime_projection_mode", fallback="frame_only").strip().lower()
+				if runtime_projection_mode in ("frame_only", "rotation_only"):
+					map_opts["--runtime-frame-gmst-only"] = ""
+				elif runtime_projection_mode != "full":
+					raise ValueError("[skymap] runtime_projection_mode must be 'frame_only' or 'full'")
+				if cp.get("skymap", "runtime_projection_frame_gmst_scale", fallback="").strip():
+					map_opts["--runtime-projection-frame-gmst-scale"] = cp.get("skymap", "runtime_projection_frame_gmst_scale")
+				if cp.get("skymap", "time_prior_half_width", fallback="").strip():
+					map_opts["--time-prior-center"] = resolve_time_prior_center(cp, row)
+					map_opts["--time-prior-half-width"] = resolve_time_prior_half_width(cp, row)
 		if row.get("start_idx"):
 			map_opts["--start-idx"] = row["start_idx"]
-		map_opts = {k: v for k, v in map_opts.items() if v != ""}
+		if skymap_timing:
+			map_opts["--timing"] = ""
+		boolean_map_flags = {
+			"--direct-time-prior",
+			"--coherent-likelihood",
+			"--paper-flat-noise",
+			"--paper-delta-template",
+				"--paper-no-shift-autocorr",
+			"--runtime-projection-gmst",
+			"--runtime-frame-gmst-only",
+			"--no-output-coefficients",
+			"--adaptive",
+			"--adaptive-refine-neighbors",
+			"--containment-calibration",
+			"--timing",
+		}
+		map_opts = {k: v for k, v in map_opts.items() if v != "" or k in boolean_map_flags}
 
-		map_inputs = [calc_dir]
-		if precalc_dir:
-			map_inputs.append(precalc_dir)
-		else:
-			map_inputs.append(row_psd)
 		map_opts_list.append(map_opts)
-		map_io_list.append({"inputs": map_inputs, "outputs": [fits, fits_p, fits_n, coeff_p, coeff_n, png]})
+		map_io_list.append({"inputs": map_inputs, "outputs": map_outputs})
+
+		if run_bayestar:
+			coinc_event_id = row.get("coinc_event_id", "")
+			if not coinc_event_id:
+				raise ValueError(f"manifest row for simulation {sim_id} has no coinc_event_id needed by BAYESTAR")
+			bayestar_opts = {
+				"--input-sqlite": bayestar_database,
+				"--calc-snr-dir": calc_dir,
+				"--coinc-event-id": coinc_event_id,
+				"--output-fits": bayestar_fits,
+				"--omp-num-threads": cp.get("bayestar", "omp_num_threads", fallback="").strip() or cp.get("condor", "request_cpus", fallback="1"),
+			}
+			if row_psd:
+				bayestar_opts["--psd-xml"] = row_psd
+			if bayestar_write_png:
+				bayestar_opts["--output-png"] = bayestar_png
+			for config_name, option in (
+				("f_low", "--f-low"),
+				("f_high_truncate", "--f-high-truncate"),
+				("waveform", "--waveform"),
+				("min_distance", "--min-distance"),
+				("max_distance", "--max-distance"),
+				("prior_distance_power", "--prior-distance-power"),
+				("rescale_loglikelihood", "--rescale-loglikelihood"),
+				("loglevel", "--loglevel"),
+				("snr_series_half_width", "--snr-series-half-width"),
+			):
+				if cp.get("bayestar", config_name, fallback="").strip():
+					bayestar_opts[option] = cp.get("bayestar", config_name)
+			if cp.getboolean("bayestar", "disable_snr_series", fallback=False):
+				bayestar_opts["--disable-snr-series"] = ""
+			if cp.getboolean("bayestar", "keep_going", fallback=True):
+				bayestar_opts["--keep-going"] = ""
+			bayestar_opts_list.append(bayestar_opts)
+			bayestar_outputs = [bayestar_fits]
+			if bayestar_write_png:
+				bayestar_outputs.append(bayestar_png)
+			bayestar_inputs = [bayestar_database, calc_dir]
+			if row_psd:
+				bayestar_inputs.append(row_psd)
+			bayestar_io_list.append({"inputs": bayestar_inputs, "outputs": bayestar_outputs})
 	log(f"prepared {len(calc_opts_list)} gstlal_inspiral_calc_snr jobs")
 	log(f"prepared {len(map_opts_list)} sph_skymap_from_calc_snr jobs")
+	if run_bayestar:
+		log(f"prepared {len(bayestar_opts_list)} sph_bayestar_from_sqlite jobs")
+	log("skymap jobs by backend: " + ", ".join(f"{name}={count}" for name, count in sorted(map_backend_counts.items())))
 
 	log("writing DAG and submit files")
 	calc_layer.batch_set_arguments(calc_opts_list, list_of_io=calc_io_list)
 	map_layer.batch_set_arguments(map_opts_list, list_of_io=map_io_list)
+	if run_bayestar:
+		bayestar_layer.batch_set_arguments(bayestar_opts_list, list_of_io=bayestar_io_list)
 
 	dag = baseDAG(dag_dir=dag_dir, dag_filename=cp.get("workflow", "dag_filename", fallback="injection_skymaps.dag"))
 	calc_dag_layer = dag.add_layer(
@@ -569,6 +828,13 @@ def main():
 		category="sph_skymap_from_calc_snr",
 		retries=cp.getint("workflow", "retries", fallback=1),
 	)
+	if run_bayestar:
+		dag.add_layer(
+			layer=bayestar_layer,
+			parents=[calc_dag_layer],
+			category="sph_bayestar_from_sqlite",
+			retries=cp.getint("bayestar", "retries", fallback=cp.getint("workflow", "retries", fallback=1)),
+		)
 	dag.write()
 
 	print("Wrote DAG:", os.path.join(dag_dir, dag.dag_filename))

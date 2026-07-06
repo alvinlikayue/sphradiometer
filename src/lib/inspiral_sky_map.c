@@ -339,7 +339,7 @@ static complex double ExcessProjectionMatrix(double theta, double phi, int i, in
  */
 
 
-static complex double CBCProjectionMatrix(double theta, double phi, int i, int j, const LALDetector **det, int n, double beta, double psi, double *psds)
+static complex double CBCProjectionMatrix(double theta, double phi, int i, int j, const LALDetector **det, int n, double beta, double psi, double gmst, double *psds, int subtract_identity)
 {
 	/* this is CBC parameterized one for arbitrary beta & psi */
 	double fplus[n], fcross[n];
@@ -350,9 +350,7 @@ static complex double CBCProjectionMatrix(double theta, double phi, int i, int j
 	normplus2 = normcross2 = 0.0;
 	for(k = 0; k < n; k++){
 		/* store fp, fc */
-		/* gmst is rotated in generate_alm_sky().
-		 * So we can set zero. */
-		XLALComputeDetAMResponse(&fplus[k], &fcross[k], det[k]->response, phi, M_PI_2 - theta, psi, 0.0);
+		XLALComputeDetAMResponse(&fplus[k], &fcross[k], det[k]->response, phi, M_PI_2 - theta, psi, gmst);
 		fplus[k] /= psds[k];
 		fcross[k] /= psds[k];
 		/* calculate norms of vector fp & fc */
@@ -360,7 +358,7 @@ static complex double CBCProjectionMatrix(double theta, double phi, int i, int j
 		normcross2 += fcross[k] * fcross[k];
 	}
 
-	return (fplus[i] + I * beta * fcross[i]) * (fplus[j] - I * beta * fcross[j]) / (normplus2 + beta*beta * normcross2) - (int)(i == j);
+	return (fplus[i] + I * beta * fcross[i]) * (fplus[j] - I * beta * fcross[j]) / (normplus2 + beta*beta * normcross2) - (subtract_identity && i == j);
 }
 
 
@@ -370,7 +368,9 @@ struct ProjectionMatrixWrapperData {
 	int n;
 	double beta;
 	double psi;
+	double gmst;
 	double *psds;
+	int subtract_identity;
 };
 
 
@@ -381,7 +381,7 @@ static complex double ProjectionMatrixWrapper(double theta, double phi, void *_d
 #if 0
 	return ExcessProjectionMatrix(theta, phi, data->i, data->j, data->det, data->n);
 #else
-	return CBCProjectionMatrix(theta, phi, data->i, data->j, data->det, data->n, data->beta, data->psi, data->psds);
+	return CBCProjectionMatrix(theta, phi, data->i, data->j, data->det, data->n, data->beta, data->psi, data->gmst, data->psds, data->subtract_identity);
 #endif
 }
 
@@ -420,7 +420,7 @@ static struct correlator_plan_fd *correlator_plan_mult_by_projection(struct corr
 }
 
 
-int correlator_network_plan_mult_by_projection(struct correlator_network_plan_fd *plan, double beta, double psi, double **psd)
+int correlator_network_plan_mult_by_projection_gmst_frame(struct correlator_network_plan_fd *plan, double beta, double psi, double response_gmst, double frame_gmst, double **psd)
 {
 	int i, j;
 	struct sh_series **projection = malloc(plan->plans[0]->delay_product->n * sizeof(*projection));
@@ -461,7 +461,9 @@ int correlator_network_plan_mult_by_projection(struct correlator_network_plan_fd
 				.n = instrument_array_len(instruments),
 				.beta = beta,
 				.psi = psi,
-				.psds = psd[j]
+				.gmst = response_gmst,
+				.psds = psd[j],
+				.subtract_identity = 1
 			};
 			if(!sh_series_from_func(projection[j], ProjectionMatrixWrapper, &data)) {
 				goto error;
@@ -488,17 +490,17 @@ int correlator_network_plan_mult_by_projection(struct correlator_network_plan_fd
 		 * aziumthal symmetry of that operator, so we need to
 		 * rotate the projection function we've just computed the
 		 * same way */
-		{
-		double *R = sh_series_invrot_matrix(plan->baselines->baselines[i]->theta, plan->baselines->baselines[i]->phi);
-		struct sh_series_rotation_plan *rot = sh_series_rotation_plan_new(projection[0], R);
-		free(R);
-		for(j = 0; j < plan->plans[i]->delay_product->n; j++) {
-			struct sh_series *cpy = sh_series_copy(projection[j]);
-			sh_series_rotate(projection[j], cpy, rot);
-			sh_series_free(cpy);
-		}
-		sh_series_rotation_plan_free(rot);
-		}
+			{
+				double *R = sh_series_invrot_matrix(plan->baselines->baselines[i]->theta, plan->baselines->baselines[i]->phi + frame_gmst);
+			struct sh_series_rotation_plan *rot = sh_series_rotation_plan_new(projection[0], R);
+			free(R);
+			for(j = 0; j < plan->plans[i]->delay_product->n; j++) {
+				struct sh_series *cpy = sh_series_copy(projection[j]);
+				sh_series_rotate(projection[j], cpy, rot);
+				sh_series_free(cpy);
+			}
+			sh_series_rotation_plan_free(rot);
+			}
 		/* multiply each frequency bin of the delay operator by the
 		 * projection operator */
 		if(!correlator_plan_mult_by_projection(plan->plans[i], projection)) {
@@ -517,9 +519,9 @@ int correlator_network_plan_mult_by_projection(struct correlator_network_plan_fd
 		 * rotation */
 		if(!sh_series_set_polar(plan->plans[i]->power_1d, 0) || !sh_series_resize(plan->plans[i]->power_1d, plan->plans[i]->delay_product->series[0].l_max)) {
 			goto error;
-		}
-		{
-		double *R = sh_series_rot_matrix(plan->baselines->baselines[i]->theta, plan->baselines->baselines[i]->phi);
+			}
+			{
+			double *R = sh_series_rot_matrix(plan->baselines->baselines[i]->theta, plan->baselines->baselines[i]->phi + frame_gmst);
 		if(!R) {
 			goto error;
 		}
@@ -546,6 +548,30 @@ error:
 	free(projection);
 	free(det);
 	return -1;
+}
+
+
+int correlator_network_plan_mult_by_projection_gmst(struct correlator_network_plan_fd *plan, double beta, double psi, double gmst, double **psd)
+{
+	return correlator_network_plan_mult_by_projection_gmst_frame(plan, beta, psi, gmst, gmst, psd);
+}
+
+
+int correlator_network_plan_mult_by_projection(struct correlator_network_plan_fd *plan, double beta, double psi, double **psd)
+{
+	return correlator_network_plan_mult_by_projection_gmst_frame(plan, beta, psi, 0.0, 0.0, psd);
+}
+
+
+int correlator_network_plan_conj_delay_product(struct correlator_network_plan_fd *plan)
+{
+	int i, j;
+
+	for(i = 0; i < plan->baselines->n_baselines; i++)
+		for(j = 0; j < plan->plans[i]->delay_product->n; j++)
+			sh_series_conj(&plan->plans[i]->delay_product->series[j]);
+
+	return 0;
 }
 
 
@@ -603,11 +629,12 @@ static struct sh_series ***diagonal_projections(const struct instrument_array *i
 				.i = i,
 				.j = i,
 				.det = det,
-				.n = instrument_array_len(instruments),
-				.beta = beta,
-				.psi = psi,
-				.psds = psd[j]
-			};
+					.n = instrument_array_len(instruments),
+					.beta = beta,
+					.psi = psi,
+					.psds = psd[j],
+					.subtract_identity = 0
+				};
 			if(!sh_series_from_func(projection[i][j], ProjectionMatrixWrapper, &data)) {
 				goto error;
 			}
@@ -691,19 +718,20 @@ void autocorrelator_network_plan_fd_free(struct autocorrelator_network_plan_fd *
 }
 
 
-static int autocorrelator_network_from_projection(struct sh_series *sky, complex double **fseries, struct autocorrelator_network_plan_fd *plan)
+static int autocorrelator_network_from_projection(struct sh_series *sky, complex double **fseries, struct autocorrelator_network_plan_fd *plan, double auto_term_scale)
 {
 	int i, j;
 	double normalization_factor;
 
 	normalization_factor = 1. / (plan->length * plan->length);
-	for(j = 2; j <= instrument_array_len(plan->instruments); j++)
+	for(j = 2; j <= instrument_array_len(plan->instruments); j++) {
 		normalization_factor /= j;
+	}
 
 	for(i = 0; i < instrument_array_len(plan->instruments); i++) {
-		/* execute calc. */
-		for(j = 0; j < plan->length; j++)
-			sh_series_add(sky, fseries[i][j] * conj(fseries[i][j]) * normalization_factor, plan->projections[i][j]);
+			/* execute calc. */
+			for(j = 0; j < plan->length; j++)
+				sh_series_add(sky, auto_term_scale * fseries[i][j] * conj(fseries[i][j]) * normalization_factor, plan->projections[i][j]);
 	}
 
 	return 0;
@@ -828,6 +856,70 @@ static int whiten(complex double *series, complex double *noise, int length)
 }
 
 
+static int shift_autocorrelation_zero_lag(const complex double *series, complex double *shifted, int length)
+{
+	int i;
+	int zero_lag = 0;
+	double max = -1.0;
+
+	for(i = 0; i < length; i++) {
+		const double value = cabs(series[i]);
+		if(value > max) {
+			max = value;
+			zero_lag = i;
+		}
+	}
+	for(i = 0; i < length; i++)
+		shifted[i] = series[(i + zero_lag) % length];
+
+	return 0;
+}
+
+
+static int make_autocorrelation_template_series(complex double **template_fseries, COMPLEX16Sequence **nseries, int n)
+{
+	int k;
+
+	for(k = 0; k < n; k++) {
+		complex double *shifted = malloc(nseries[k]->length * sizeof(*shifted));
+		fftw_plan plan;
+
+		if(!shifted)
+			return -1;
+		if(shift_autocorrelation_zero_lag(nseries[k]->data, shifted, nseries[k]->length)) {
+			free(shifted);
+			return -1;
+		}
+		plan = correlator_ctseries_to_fseries_plan(shifted, template_fseries[k], nseries[k]->length);
+		if(!plan) {
+			free(shifted);
+			return -1;
+		}
+		correlator_ctseries_to_fseries(plan);
+		fftw_destroy_plan(plan);
+		free(shifted);
+	}
+
+	return 0;
+}
+
+
+static int make_template_weighted_series(complex double **weighted, complex double **fseries, complex double **template_fseries, int n, int length)
+{
+	int k;
+
+	for(k = 0; k < n; k++) {
+		int i;
+		for(i = 0; i < length; i++) {
+			const double norm = cabs(template_fseries[k][i]);
+			weighted[k][i] = norm > 0.0 ? fseries[k][i] * conj(template_fseries[k][i]) / norm : 0.0;
+		}
+	}
+
+	return 0;
+}
+
+
 /*
  * ============================================================================
  *
@@ -866,15 +958,61 @@ struct sh_series *sh_series_log_uniformsky_prior(int l_max)
 
 
 
-static int generate_alm_sky(struct sh_series *sky, struct correlator_network_plan_fd *fdplans, struct autocorrelator_network_plan_fd *fdautoplan, complex double **fseries, complex double **fnseries, double gmst, struct sh_series *logprior)
+static complex double *geocentric_time_window_new(const COMPLEX16TimeSeries *series, double center, double half_width, int *is_noop)
 {
+	complex double *window;
+	double epoch;
+	double duration;
+	unsigned i;
+	unsigned n_in_window = 0;
+
+	*is_noop = 0;
+	if(half_width < 0.0)
+		return NULL;
+
+	epoch = XLALGPSGetREAL8(&series->epoch);
+	duration = series->data->length * series->deltaT;
+	if(center - half_width <= epoch && epoch + duration <= center + half_width) {
+		*is_noop = 1;
+		fprintf(stderr, "geocentric time window covers full span; using unwindowed FD correlator\n");
+		return NULL;
+	}
+
+	window = calloc(series->data->length, sizeof(*window));
+	if(!window)
+		return NULL;
+
+	for(i = 0; i < series->data->length; i++) {
+		const double t = epoch + i * series->deltaT;
+		if(fabs(t - center) <= half_width) {
+			window[i] = 1.0;
+			n_in_window++;
+		}
+	}
+
+	if(!n_in_window) {
+		fprintf(stderr, "empty geocentric time window: center=%.16g half_width=%.16g epoch=%.16g duration=%.16g samples=%u\n", center, half_width, epoch, duration, series->data->length);
+		free(window);
+		return NULL;
+	}
+
+	fprintf(stderr, "using geocentric time window: center=%.16g half_width=%.16g samples=%u\n", center, half_width, n_in_window);
+	return window;
+}
+
+
+static int generate_alm_sky(struct sh_series *sky, struct correlator_network_plan_fd *fdplans, struct autocorrelator_network_plan_fd *fdautoplan, complex double **fseries, complex double **fnseries, const complex double *time_window, double gmst, struct sh_series *logprior, double auto_term_scale, double regulator_scale)
+{
+	if(regulator_scale < 0.0)
+		regulator_scale = fdplans->baselines->n_baselines * 4.0;
+
 	/*
 	 * Compute angular distribution of integrated cross power.
 	 */
 
 
 	fprintf(stderr, "starting integration\n");
-	if(!correlator_network_integrate_power_fd(sky, fseries, fdplans)) {
+	if(!correlator_network_integrate_power_fd_window(sky, fseries, time_window, fdplans)) {
 		fprintf(stderr, "cross-correlator failed\n");
 		return -1;
 	}
@@ -889,15 +1027,15 @@ static int generate_alm_sky(struct sh_series *sky, struct correlator_network_pla
 	sh_series_scale(sky, 2.0);
 	/* above one is for only cross-correlator, below one for cross- and
 	 * auto-correlator */
-#if 0
-	/* add contributions from diagonal part, auto-correlation. FIXME: check
-	 * consistency between above and below sh_series_scale() */
-	fprintf(stderr, "including auto-correlation terms\n");
-	if(autocorrelator_network_from_projection(sky, fseries, fdautoplan)) {
-		fprintf(stderr, "auto-correlator failed\n");
-		exit(1);
+	if(auto_term_scale != 0.0) {
+		/* add contributions from diagonal part, auto-correlation. FIXME: check
+		 * consistency between above and below sh_series_scale() */
+		fprintf(stderr, "including auto-correlation terms with scale %.16g\n", auto_term_scale);
+		if(autocorrelator_network_from_projection(sky, fseries, fdautoplan, auto_term_scale)) {
+			fprintf(stderr, "auto-correlator failed\n");
+			return -1;
+		}
 	}
-#endif
 	/* multiply baseline numbers. Correlator is normalized by it (See
 	 * correlator_network_integrate_power_fd()). However our calculation
 	 * doesn't need it. */
@@ -912,7 +1050,7 @@ static int generate_alm_sky(struct sh_series *sky, struct correlator_network_pla
 	 * as multiplying a regulator. The regulator should be normalized. One
 	 * SNR timeseries give us one 2 as normalized factor. Hence multiply 4.
 	 * */
-	sh_series_scale(sky, fdplans->baselines->n_baselines * 4.0);
+	sh_series_scale(sky, regulator_scale);
 	fprintf(stderr, "finished integration\n");
 
 
@@ -939,10 +1077,15 @@ static int generate_alm_sky(struct sh_series *sky, struct correlator_network_pla
 }
 
 
-int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct correlator_network_plan_fd *fdplansp, struct correlator_network_plan_fd *fdplansn, struct autocorrelator_network_plan_fd *fdautoplanp, struct autocorrelator_network_plan_fd *fdautoplann, COMPLEX16TimeSeries **series, COMPLEX16Sequence **nseries, struct sh_series *logprior)
+int generate_alm_skys_options(struct sh_series **skyp, struct sh_series **skyn, struct correlator_network_plan_fd *fdplansp, struct correlator_network_plan_fd *fdplansn, struct autocorrelator_network_plan_fd *fdautoplanp, struct autocorrelator_network_plan_fd *fdautoplann, COMPLEX16TimeSeries **series, COMPLEX16Sequence **nseries, struct sh_series *logprior, double auto_term_scale, int include_whitening, double regulator_scale, double time_prior_center, double time_prior_half_width, int use_autocorrelation_template)
 {
 	complex double **fseries;
 	complex double **fnseries;
+	complex double **template_fseries;
+	complex double **weighted_fseries;
+	complex double **sky_fseries;
+	complex double *time_window;
+	int time_window_is_noop = 0;
 	fftw_plan *fftplans;
 	fftw_plan *nfftplans;
 	int n = instrument_array_len(fdplansp->baselines->baselines[0]->instruments);
@@ -956,9 +1099,11 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 
 	fseries = malloc(n * sizeof(*fseries));
 	fnseries = malloc(n * sizeof(*fnseries));
+	template_fseries = malloc(n * sizeof(*template_fseries));
+	weighted_fseries = malloc(n * sizeof(*weighted_fseries));
 	fftplans = malloc(n * sizeof(*fftplans));
 	nfftplans = malloc(n * sizeof(*nfftplans));
-	if(!fseries || !fftplans || !fnseries || !nfftplans) {
+	if(!fseries || !fftplans || !fnseries || !nfftplans || !template_fseries || !weighted_fseries) {
 		XLALPrintError("out of memory\n");
 		return -1;
 	}
@@ -976,6 +1121,12 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 		memcpy(nsave, nseries[k]->data, nseries[k]->length * sizeof(*nsave));
 		fseries[k] = malloc(series[k]->data->length * sizeof(**fseries));
 		fnseries[k] = malloc(nseries[k]->length * sizeof(**fnseries));
+		template_fseries[k] = malloc(nseries[k]->length * sizeof(**template_fseries));
+		weighted_fseries[k] = malloc(series[k]->data->length * sizeof(**weighted_fseries));
+		if(!fseries[k] || !fnseries[k] || !template_fseries[k] || !weighted_fseries[k]) {
+			XLALPrintError("out of memory\n");
+			return -1;
+		}
 		fftplans[k] = correlator_ctseries_to_fseries_plan(series[k]->data->data, fseries[k], series[k]->data->length);
 		nfftplans[k] = correlator_ctseries_to_fseries_plan(nseries[k]->data, fnseries[k], nseries[k]->length);
 		memcpy(series[k]->data->data, save, series[k]->data->length * sizeof(*save));
@@ -1017,35 +1168,50 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 #endif
 	}
 
+	if(use_autocorrelation_template) {
+		fprintf(stderr, "using autocorrelation-shaped SNR templates\n");
+		if(make_autocorrelation_template_series(template_fseries, nseries, n)) {
+			fprintf(stderr, "failed to construct autocorrelation template spectra\n");
+			return -1;
+		}
+		if(make_template_weighted_series(weighted_fseries, fseries, template_fseries, n, series[0]->data->length)) {
+			fprintf(stderr, "failed to construct template-weighted SNR spectra\n");
+			return -1;
+		}
+		sky_fseries = weighted_fseries;
+	} else {
+		sky_fseries = fseries;
+	}
+
 
 	/*
 	 * Whitening
 	 */
 
 
-#if 0
-//	double min = cabs(fnseries[0][0]);
-//	for(k = 0; k < n; k++)
-//		for(j = 0; j < (int) series[k]->data->length; j++)
-//			if(min > cabs(fnseries[k][j]))
-//				min = cabs(fnseries[k][j]);
-//	min *= 1e3;
-//	fprintf(stderr, "threshold = %g\n", min);
+	if(include_whitening) {
+	//	double min = cabs(fnseries[0][0]);
+	//	for(k = 0; k < n; k++)
+	//		for(j = 0; j < (int) series[k]->data->length; j++)
+	//			if(min > cabs(fnseries[k][j]))
+	//				min = cabs(fnseries[k][j]);
+	//	min *= 1e3;
+	//	fprintf(stderr, "threshold = %g\n", min);
 
-	for(k = 0; k < n; k++){
-		double temp = 0;
-		unsigned i;
-		for(i = 0; i < series[k]->data->length; i++)
-			temp += cabs(fnseries[k][i]);
-		for(i = 0; i < series[k]->data->length; i++)
-			fnseries[k][i] /= temp * temp;
+		for(k = 0; k < n; k++){
+			double temp = 0;
+			unsigned i;
+			for(i = 0; i < series[k]->data->length; i++)
+				temp += cabs(fnseries[k][i]);
+			for(i = 0; i < series[k]->data->length; i++)
+				fnseries[k][i] /= temp * temp;
 
-		//threshold(fseries[k], fnseries[k], series[k]->data->length, min);
-		whiten(fseries[k], fnseries[k], series[k]->data->length);
-		//partial_whiten(fseries[k], fnseries[k], (int) (1024 * series[k]->data->length * series[k]->deltaT), (int) (2048 * series[k]->data->length * series[k]->deltaT));
-		//filter(fseries[k], (int) (15 * series[k]->data->length * series[k]->deltaT), (int) (1024 * series[k]->data->length * series[k]->deltaT), series[k]->data->length);
+			//threshold(fseries[k], fnseries[k], series[k]->data->length, min);
+			whiten(fseries[k], fnseries[k], series[k]->data->length);
+			//partial_whiten(fseries[k], fnseries[k], (int) (1024 * series[k]->data->length * series[k]->deltaT), (int) (2048 * series[k]->data->length * series[k]->deltaT));
+			//filter(fseries[k], (int) (15 * series[k]->data->length * series[k]->deltaT), (int) (1024 * series[k]->data->length * series[k]->deltaT), series[k]->data->length);
+		}
 	}
-#endif
 #if 0
 	for(k = 0; k < n; k++){
 		unsigned i; for(i = 0; i < series[k]->data->length; i++) fprintf(stderr, "%3d %g  %g\n", i, cabs(fseries[k][i]), cabs(fnseries[k][i])); fprintf(stderr, "\n");
@@ -1061,6 +1227,12 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 	}
 #endif
 
+	time_window = geocentric_time_window_new(series[0], time_prior_center, time_prior_half_width, &time_window_is_noop);
+	if(time_prior_half_width >= 0.0 && !time_window && !time_window_is_noop) {
+		fprintf(stderr, "failed to construct geocentric time window\n");
+		return -1;
+	}
+
 
 	/*
 	 * Generate sky alm for each parameters of CBC
@@ -1068,14 +1240,14 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 
 
 	*skyp = sh_series_new_zero(logprior->l_max, 0);
-	if(generate_alm_sky(*skyp, fdplansp, fdautoplanp, fseries, fnseries, gmst_from_epoch_and_offset(series[0]->epoch, series[0]->data->length * series[0]->deltaT / 2.0), logprior)) {
+	if(generate_alm_sky(*skyp, fdplansp, fdautoplanp, sky_fseries, fnseries, time_window, gmst_from_epoch_and_offset(series[0]->epoch, series[0]->data->length * series[0]->deltaT / 2.0), logprior, auto_term_scale, regulator_scale)) {
 		fprintf(stderr, "positive generate_alm_sky error\n");
 		return -1;
 	}
 
 
 	*skyn = sh_series_new_zero(logprior->l_max, 0);
-	if(generate_alm_sky(*skyn, fdplansn, fdautoplann, fseries, fnseries, gmst_from_epoch_and_offset(series[0]->epoch, series[0]->data->length * series[0]->deltaT / 2.0), logprior)) {
+	if(generate_alm_sky(*skyn, fdplansn, fdautoplann, sky_fseries, fnseries, time_window, gmst_from_epoch_and_offset(series[0]->epoch, series[0]->data->length * series[0]->deltaT / 2.0), logprior, auto_term_scale, regulator_scale)) {
 		fprintf(stderr, "negative generate_alm_sky error\n");
 		return -1;
 	}
@@ -1089,15 +1261,26 @@ int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct c
 	for(k = 0; k < n; k++) {
 		free(fseries[k]);
 		free(fnseries[k]);
+		free(template_fseries[k]);
+		free(weighted_fseries[k]);
 		fftw_destroy_plan(fftplans[k]);
 		fftw_destroy_plan(nfftplans[k]);
 	}
 	free(fseries);
 	free(fnseries);
+	free(template_fseries);
+	free(weighted_fseries);
+	free(time_window);
 	free(fftplans);
 	free(nfftplans);
 
 	return 0;
+}
+
+
+int generate_alm_skys(struct sh_series **skyp, struct sh_series **skyn, struct correlator_network_plan_fd *fdplansp, struct correlator_network_plan_fd *fdplansn, struct autocorrelator_network_plan_fd *fdautoplanp, struct autocorrelator_network_plan_fd *fdautoplann, COMPLEX16TimeSeries **series, COMPLEX16Sequence **nseries, struct sh_series *logprior)
+{
+	return generate_alm_skys_options(skyp, skyn, fdplansp, fdplansn, fdautoplanp, fdautoplann, series, nseries, logprior, 0.0, 0, -1.0, 0.0, -1.0, 1);
 }
 
 

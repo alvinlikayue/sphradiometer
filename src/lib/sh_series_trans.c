@@ -394,7 +394,7 @@ struct sh_series_eval_interp *sh_series_eval_interp_new(const struct sh_series *
 	double x;
 	/* populate the rows for the north and south poles.  these aren't
 	 * in the pixel mesh, they need to be evaluated explicitly */
-	x = creal(sh_series_eval(series, 0., 0.));
+	x = cimag(sh_series_eval(series, 0., 0.));
 	for(i = 0; i < interp->nphi + 4; i++)
 		interp_mesh[(0) * (interp->nphi + 4) + i] = x;
 	x = creal(sh_series_eval(series, M_PI, 0.));

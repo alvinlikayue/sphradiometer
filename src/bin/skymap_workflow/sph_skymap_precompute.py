@@ -28,6 +28,7 @@ def main():
 	parser.add_argument("--delta-t", type=float, default=1.0 / 2048.0)
 	parser.add_argument("--sample-rate", type=float, default=2048.0)
 	parser.add_argument("--effective-sample-rate", type=int, default=512)
+	parser.add_argument("--apply-projection", action="store_true", help="bake antenna/PSD projection into the precomputed harmonic plans")
 	parser.add_argument("--force", action="store_true")
 	args = parser.parse_args()
 
@@ -78,6 +79,7 @@ def main():
 			args.precalc_len,
 			args.delta_t,
 			effective_sample_rate=args.effective_sample_rate,
+			apply_projection=args.apply_projection,
 		)
 		loc.write(combo_dir)
 	else:
@@ -86,6 +88,7 @@ def main():
 			args.precalc_len,
 			args.delta_t,
 			effective_sample_rate=args.effective_sample_rate,
+			apply_projection=args.apply_projection,
 		)
 		loc.write(args.output_dir)
 
@@ -103,6 +106,7 @@ def main():
 				"delta_t": args.delta_t,
 				"sample_rate": args.sample_rate,
 				"effective_sample_rate": args.effective_sample_rate,
+				"apply_projection": args.apply_projection,
 			},
 			f,
 			indent=2,

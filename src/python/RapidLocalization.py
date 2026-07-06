@@ -99,7 +99,23 @@ def transpose_psd_array(psds, length):
 	return tpsds_array
 
 
-#
+def unit_psd_array(instruments, length):
+	psds_array = sph.new_doublep_array(length)
+	for i in range(length):
+		row = sph.new_double_array(len(instruments))
+		for j in range(len(instruments)):
+			sph.double_array_setitem(row, j, 1.0)
+		sph.doublep_array_setitem(psds_array, i, row)
+	return psds_array
+
+
+def delete_transposed_psd_array(psds_array, length):
+	for i in range(length):
+		sph.delete_double_array(sph.doublep_array_getitem(psds_array, i))
+	sph.delete_doublep_array(psds_array)
+
+
+	#
 # ==============================================================================
 #
 #                                   Time Series
@@ -187,7 +203,7 @@ class convert_TimeSeries2Sequence_wrap(object):
 
 
 class RapidLocalization_(object):
-	def __init__(self, psds, precalc_length, deltaT, effective_sample_rate=512):
+	def __init__(self, psds, precalc_length, deltaT, effective_sample_rate=512, apply_projection=True):
 		"""
 		Parameter
 		---------
@@ -223,8 +239,9 @@ class RapidLocalization_(object):
 
 			self.fdplansp = sph.correlator_network_plan_fd_new(self.baselines, self.precalc_length, deltaT)
 			self.fdplansn = sph.correlator_network_plan_fd_copy(self.fdplansp)
-			sph.correlator_network_plan_mult_by_projection(self.fdplansp, +1, 0, psd_array)
-			sph.correlator_network_plan_mult_by_projection(self.fdplansn, -1, 0, psd_array)
+			if apply_projection:
+				sph.correlator_network_plan_mult_by_projection(self.fdplansp, +1, 0, psd_array)
+				sph.correlator_network_plan_mult_by_projection(self.fdplansn, -1, 0, psd_array)
 
 			self.fdautoplanp = sph.autocorrelator_network_plan_fd_new(self.inst_array, +1, 0, psd_array, int(sph.pick_ith_correlator_plan_fd(self.fdplansp.plans, 0).delay_product.n), self.logprior.l_max)
 			self.fdautoplann = sph.autocorrelator_network_plan_fd_new(self.inst_array, -1, 0, psd_array, int(sph.pick_ith_correlator_plan_fd(self.fdplansp.plans, 0).delay_product.n), self.logprior.l_max)
@@ -238,12 +255,11 @@ class RapidLocalization_(object):
 			sph.delete_double_array(sph.doublep_array_getitem(psd_array, i))
 		sph.delete_doublep_array(psd_array)
 
-		# reduce the upper cutoff of spheical index l
-		# Up to 512 Hz, SNR of the CBC waveforms are > 99% accumulated.
+		# reduce the upper cutoff of spherical index l.
 		self.reduce_l_max(1. / effective_sample_rate)
 
 
-	def sphcoeff(self, snr, aut, power=0.6, overall=2.7):
+	def sphcoeff(self, snr, aut, power=0.6, overall=2.7, auto_term_scale=0.0, include_whitening=False, regulator_scale=-1.0, conjugate_delay_product=False, swap_frequency_product=False, time_prior_center=0.0, time_prior_half_width=-1.0, use_autocorrelation_template=True, runtime_projection_gmst=None, runtime_projection_frame_gmst=None, runtime_frame_gmst_only=False, runtime_psds=None):
 		"""
 		Parameter
 		---------
@@ -255,9 +271,8 @@ class RapidLocalization_(object):
 		Returns
 		-------
 		output : tuple of coeff_series instances
-			object to store a localization result for \\beta = +/-1
+			object to store a localization result for \beta = +/-1
 		"""
-		# construct **COMPLEX16_array
 		sph_snr = {ifo: create_sph_COMPLEX16TimeSeries_wrap(snr[ifo]) for ifo in snr}
 		sph_aut = {ifo: create_sph_COMPLEX16Sequence_wrap(aut[ifo]) for ifo in aut}
 		seriesp = sph.new_COMPLEX16TimeSeries_array(len(snr))
@@ -267,30 +282,67 @@ class RapidLocalization_(object):
 			sph.COMPLEX16Sequence_array_setitem(nseriesp, i, sph_aut[ifo].series)
 		sph.preprocess_SNRTimeSeries(seriesp, nseriesp, len(self.instruments))
 
-		# consistency check
 		assert self.instruments == sorted(snr.keys()), "instruments are inconsistent"
 		if len(snr) > 1:
 			assert self.precalc_length == sph.pick_length_from_COMPLEX16TimeSeries(sph.COMPLEX16TimeSeries_array_getitem(seriesp, 0)), "SNR time series length is inconsistent"
 
-		# store sph coefficient series result
 		skyp = coeff_series(len(self.instruments))
 		skyn = coeff_series(len(self.instruments))
 		if sph.instrument_array_len(self.inst_array) > 1:
-			# multi detector case
-			sph.generate_alm_skys(skyp.coeff, skyn.coeff, self.fdplansp, self.fdplansn, self.fdautoplanp, self.fdautoplann, seriesp, nseriesp, self.logprior)
+			fdplansp = self.fdplansp
+			fdplansn = self.fdplansn
+			psd_array = None
+			if runtime_projection_gmst is not None:
+				fdplansp = sph.correlator_network_plan_fd_copy(self.fdplansp)
+				fdplansn = sph.correlator_network_plan_fd_copy(self.fdplansn)
+				if runtime_projection_frame_gmst is None:
+					runtime_projection_frame_gmst = runtime_projection_gmst
+				if runtime_frame_gmst_only:
+					sph.correlator_network_plan_fd_set_frame_gmst(fdplansp, runtime_projection_frame_gmst)
+					sph.correlator_network_plan_fd_set_frame_gmst(fdplansn, runtime_projection_frame_gmst)
+				else:
+					if runtime_psds is None:
+						psd_array = unit_psd_array(self.instruments, self.precalc_length)
+					else:
+						psd_array = transpose_psd_array(runtime_psds, self.precalc_length)
+					sph.correlator_network_plan_mult_by_projection_gmst_frame(fdplansp, +1, 0, runtime_projection_gmst, runtime_projection_frame_gmst, psd_array)
+					sph.correlator_network_plan_mult_by_projection_gmst_frame(fdplansn, -1, 0, runtime_projection_gmst, runtime_projection_frame_gmst, psd_array)
+			if conjugate_delay_product:
+				sph.correlator_network_plan_conj_delay_product(fdplansp)
+				sph.correlator_network_plan_conj_delay_product(fdplansn)
+			sph.correlator_network_plan_fd_set_swap_frequency_product(fdplansp, int(swap_frequency_product))
+			sph.correlator_network_plan_fd_set_swap_frequency_product(fdplansn, int(swap_frequency_product))
+			status = sph.generate_alm_skys_options(
+				skyp.coeff,
+				skyn.coeff,
+				fdplansp,
+				fdplansn,
+				self.fdautoplanp,
+				self.fdautoplann,
+				seriesp,
+				nseriesp,
+				self.logprior,
+				auto_term_scale,
+				int(include_whitening),
+				regulator_scale,
+				time_prior_center,
+				time_prior_half_width,
+				int(use_autocorrelation_template)
+			)
+			if runtime_projection_gmst is not None:
+				if psd_array is not None:
+					delete_transposed_psd_array(psd_array, self.precalc_length)
+				sph.correlator_network_plan_fd_free(fdplansp)
+				sph.correlator_network_plan_fd_free(fdplansn)
+			if status:
+				raise RuntimeError("generate_alm_skys_options failed")
 
-			# weight sph coefficient series with overall * (l /
-			# l_max)^power
-			# For (power, overall) = (0.6, 2.7), the p-p plot is
-			# consistent for 512 Hz of the upper frequency cutoff
 			sph.sh_seriespp_assign(skyp.coeff, sph.sh_series_scale_power_l(skyp.get(), power, overall))
 			sph.sh_seriespp_assign(skyn.coeff, sph.sh_series_scale_power_l(skyn.get(), power, overall))
 		else:
-			# single detector case
 			sph.sh_seriesp_assign(skyp.coeff, self.logprior)
 			sph.sh_seriesp_assign(skyn.coeff, self.logprior)
 
-		# free
 		del sph_snr, sph_aut
 		sph.delete_COMPLEX16TimeSeries_array(seriesp)
 		sph.delete_COMPLEX16Sequence_array(nseriesp)
@@ -381,7 +433,7 @@ class RapidLocalization_(object):
 
 
 class RapidLocalization(object):
-	def __init__(self, psds, precalc_length, deltaT, effective_sample_rate=512):
+	def __init__(self, psds, precalc_length, deltaT, effective_sample_rate=512, apply_projection=True):
 		"""
 		Parameter
 		---------
@@ -408,13 +460,14 @@ class RapidLocalization(object):
 				print("initialize for", "".join(c), file=sys.stderr)
 				psds_ = {ifo : psds[ifo] for ifo in c}
 				self.precalcs["".join(c)] = RapidLocalization_(
-					psds_,
-					precalc_length,
-					deltaT,
-					effective_sample_rate
-				)
+						psds_,
+						precalc_length,
+						deltaT,
+						effective_sample_rate,
+						apply_projection=apply_projection
+					)
 
-	def sphcoeff(self, snr, aut, power=0.6, overall=2.7):
+	def sphcoeff(self, snr, aut, power=0.6, overall=2.7, auto_term_scale=0.0, include_whitening=False, regulator_scale=-1.0, conjugate_delay_product=False, swap_frequency_product=False, time_prior_center=0.0, time_prior_half_width=-1.0, use_autocorrelation_template=True, runtime_projection_gmst=None, runtime_projection_frame_gmst=None, runtime_frame_gmst_only=False, runtime_psds=None):
 		"""
 		Parameter
 		---------
@@ -428,7 +481,24 @@ class RapidLocalization(object):
 		output : tuple of coeff_series instances
 			object to store a localization result for \\beta = +/-1
 		"""
-		return self.precalcs["".join(sorted(snr))].sphcoeff(snr, aut, power=power, overall=overall)
+		return self.precalcs["".join(sorted(snr))].sphcoeff(
+			snr,
+			aut,
+			power=power,
+			overall=overall,
+			auto_term_scale=auto_term_scale,
+			include_whitening=include_whitening,
+			regulator_scale=regulator_scale,
+			conjugate_delay_product=conjugate_delay_product,
+				swap_frequency_product=swap_frequency_product,
+				time_prior_center=time_prior_center,
+				time_prior_half_width=time_prior_half_width,
+					use_autocorrelation_template=use_autocorrelation_template,
+					runtime_projection_gmst=runtime_projection_gmst,
+					runtime_projection_frame_gmst=runtime_projection_frame_gmst,
+					runtime_frame_gmst_only=runtime_frame_gmst_only,
+					runtime_psds=runtime_psds
+				)
 
 	def write(self, precalc_path):
 		"""
@@ -445,19 +515,29 @@ class RapidLocalization(object):
 				self.precalcs[name].write(os.path.join(precalc_path, name))
 
 	@classmethod
-	def read(cls, precalc_path):
+	def read(cls, precalc_path, instruments = None):
 		"""
 		Parameter
 		---------
 		precalc_path : str
 			path (name) of used precalculated objects.
+		instruments : iterable, optional
+			If provided, read only the precomputed detector combination
+			required for this instrument set.
 		"""
 		self = cls.__new__(cls)
 
 		self.precalcs = {}
-		for prei in [os.path.basename(d) for d in glob(os.path.join(precalc_path, "*"))]:
+		if instruments is None:
+			precalc_names = [os.path.basename(d) for d in glob(os.path.join(precalc_path, "*"))]
+		else:
+			precalc_names = ["".join(sorted(instruments))]
+		for prei in precalc_names:
 			print("read for", prei, file=sys.stderr)
-			self.precalcs[prei] = RapidLocalization_.read(os.path.join(precalc_path, prei))
+			path = os.path.join(precalc_path, prei)
+			if not os.path.isdir(path):
+				raise FileNotFoundError(f"missing precomputed localization directory: {path}")
+			self.precalcs[prei] = RapidLocalization_.read(path)
 		return self
 
 	def reduce_l_max(self, deltaT):
