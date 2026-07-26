@@ -684,6 +684,30 @@ struct sh_series *sh_series_sintheta_curl(const struct sh_series *u, const struc
  */
 
 
+#if 0
+
+/*
+ * On the two sphere the four components of the Hessian matrix are
+ *
+ * H[f] =
+ *  (                 d^2 f                      d^2 f       cos(theta)  d f     )
+ *  (               ---------                ------------- - ---------- -----    )
+ *  (               d theta^2                d theta d phi   sin(theta) d phi    )
+ *  (                                                                            )
+ *  (     d^2 f       cos(theta)  d f     d^2 f                            d f   )
+ *  ( ------------- - ---------- -----   ------- + cos(theta) sin(theta) ------- )
+ *  ( d theta d phi   sin(theta) d phi   d phi^2                         d theta )
+ *
+ *
+ * Gradient descent algorithms for finding minima require the evaluation of
+ * the inverse of this matrix.  GSL's implementation relies on a numerical
+ * approximation of the inverse but if we could obtain an explicit form
+ * then the extremization problem could possibly be made faster.
+ */
+
+#endif
+
+
 /*
  * Replace an sh_series object with the Laplacian of the function it
  * describes.  Spherical harmonics are eigenfunctions of the Laplacian,
