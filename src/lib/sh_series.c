@@ -609,10 +609,9 @@ struct sh_series *sh_series_scale_power_l(struct sh_series *a, double power, dou
 {
 	unsigned int l;
 	int m;
-	double factor;
 
 	for(l = 0; l <= a->l_max; l++) {
-		factor = overall_factor * pow((double) l / a->l_max, power);
+		double factor = overall_factor * pow((double) l / a->l_max, power);
 
 		for(m = -(int) l; m <= (int) l; m++) {
 			sh_series_set(a, l, m, factor * sh_series_get(a, l, m));
